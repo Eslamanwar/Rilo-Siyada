@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Siyada</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 360px;
+      min-height: 200px;
+      background: #0D1117;
+      color: #E6EDF3;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px;
+      background: linear-gradient(135deg, #161B22, #0D1117);
+      border-bottom: 1px solid #21262D;
+    }
+    .logo { font-size: 22px; }
+    .brand { flex: 1; }
+    .brand-name { font-weight: 700; font-size: 15px; color: #00D4AA; }
+    .brand-sub  { font-size: 11px; color: #8B949E; }
+
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: #21262D;
+      border-bottom: 1px solid #21262D;
+    }
+    .stat {
+      background: #0D1117;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .stat-value {
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .stat-label { font-size: 11px; color: #8B949E; text-transform: uppercase; letter-spacing: 0.5px; }
+    .c-critical { color: #FF6B6B; }
+    .c-green    { color: #00D4AA; }
+    .c-yellow   { color: #FFD60A; }
+    .c-blue     { color: #79C0FF; }
+
+    .section-title {
+      padding: 10px 16px 6px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #8B949E;
+    }
+
+    .event-list {
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .event {
+      padding: 10px 16px;
+      border-bottom: 1px solid #21262D;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .event:last-child { border-bottom: none; }
+    .event-top {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .sev-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+    }
+    .sev-critical { background: rgba(255,59,59,0.2);  color: #FF6B6B; }
+    .sev-high     { background: rgba(255,107,53,0.2); color: #FF8C61; }
+    .sev-medium   { background: rgba(255,193,7,0.15); color: #FFD60A; }
+    .sev-low      { background: rgba(139,148,158,0.2); color: #8B949E; }
+
+    .event-time { font-size: 11px; color: #8B949E; }
+    .event-url  { font-size: 11px; color: #8B949E; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .event-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+    .tag {
+      font-size: 10px;
+      padding: 2px 6px;
+      background: #161B22;
+      border: 1px solid #30363D;
+      border-radius: 4px;
+      color: #8B949E;
+    }
+
+    .empty {
+      padding: 24px 16px;
+      text-align: center;
+      color: #8B949E;
+      font-size: 13px;
+    }
+    .empty-icon { font-size: 32px; display: block; margin-bottom: 8px; }
+
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      border-top: 1px solid #21262D;
+    }
+    .compliance-badge {
+      font-size: 11px;
+      color: #00D4AA;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .clear-btn {
+      background: none;
+      border: 1px solid #30363D;
+      color: #8B949E;
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .clear-btn:hover { border-color: #6E7681; color: #E6EDF3; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="logo">🛡️</span>
+    <div class="brand">
+      <div class="brand-name">Siyada — سيادة</div>
+      <div class="brand-sub">UAE AI Data Shield</div>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <span class="stat-value c-critical" id="statTotal">0</span>
+      <span class="stat-label">Blocked Today</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value c-yellow" id="statCritical">0</span>
+      <span class="stat-label">Critical Events</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value c-blue" id="statHealth">0</span>
+      <span class="stat-label">Health Data</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value c-green" id="statFinancial">0</span>
+      <span class="stat-label">Financial Data</span>
+    </div>
+  </div>
+
+  <div id="regBanner" style="display:none; padding:8px 16px; font-size:11px; color:#8B949E; border-bottom:1px solid #21262D;">
+    Top regulation: <strong id="topReg" style="color:#E6EDF3;"></strong>
+  </div>
+
+  <div class="section-title">Recent Interceptions</div>
+
+  <div class="event-list" id="eventList">
+    <div class="empty">
+      <span class="empty-icon">✅</span>
+      No interceptions yet today.<br>Siyada is watching.
+    </div>
+  </div>
+
+  <div class="footer">
+    <span class="compliance-badge">✓ Federal Law 2/2019 compliant</span>
+    <button class="clear-btn" id="clearBtn">Clear log</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
