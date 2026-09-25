@@ -7,14 +7,27 @@
  *   node server/tools/mock-vision.js
  *   VISION_URL=http://localhost:3999 npm start
  *
- * Responds to every image as if it were an Emirates ID card. Set
- * MOCK_CLEAN=1 to respond as if every image were clean.
+ * Responds to every image as if it were an Emirates ID card, except for a new
+ * image arriving within VERIFY_WINDOW_MS of a flagged one — that is taken to be
+ * the masked copy coming back through the extension's verification loop, and is
+ * reported clean. This is a stand-in for a model that actually looks at pixels;
+ * a clean verdict from it is not evidence that masking worked.
+ *
+ *   MOCK_CLEAN=1   every image is clean
+ *   MOCK_STRICT=1  every image is flagged, so mask verification always fails
  */
 
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 
-const PORT  = Number(process.env.PORT || 3999);
-const CLEAN = process.env.MOCK_CLEAN === '1';
+const PORT   = Number(process.env.PORT || 3999);
+const CLEAN  = process.env.MOCK_CLEAN === '1';
+const STRICT = process.env.MOCK_STRICT === '1';
+
+const VERIFY_WINDOW_MS = 15_000;
+
+const verdicts = new Map(); // image digest → flagged?
+let lastFlaggedAt = 0;
 
 const CLEAN_RESULT = {
   hasPII: false,
@@ -68,10 +81,20 @@ createServer((req, res) => {
   req.on('data', (chunk) => { body += chunk; });
   req.on('end', () => {
     let mediaType = 'image/png';
-    try { ({ mediaType = 'image/png' } = JSON.parse(body)); } catch { /* ignore */ }
-    console.log(`[mock-vision] ${mediaType} ${Math.round(body.length / 1024)}KB → ${CLEAN ? 'clean' : 'flagged'}`);
+    let imageBase64 = '';
+    try { ({ mediaType = 'image/png', imageBase64 = '' } = JSON.parse(body)); } catch { /* ignore */ }
+
+    const digest = createHash('sha256').update(imageBase64).digest('hex');
+    const looksLikeMaskedCopy = !verdicts.has(digest) && Date.now() - lastFlaggedAt < VERIFY_WINDOW_MS;
+
+    const flagged = verdicts.has(digest)
+      ? verdicts.get(digest)                       // same image, same verdict
+      : !CLEAN && (STRICT || !looksLikeMaskedCopy);
+    verdicts.set(digest, flagged);
+    if (flagged) lastFlaggedAt = Date.now();
+    console.log(`[mock-vision] ${mediaType} ${Math.round(body.length / 1024)}KB → ${flagged ? 'flagged' : 'clean'}`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(CLEAN ? CLEAN_RESULT : FLAGGED_RESULT));
+    res.end(JSON.stringify(flagged ? FLAGGED_RESULT : CLEAN_RESULT));
   });
 }).listen(PORT, () => {
   console.log(`Mock vision agent on http://localhost:${PORT} (${CLEAN ? 'clean' : 'flagged'} mode)`);

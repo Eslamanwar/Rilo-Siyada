@@ -5,7 +5,8 @@
   "description": "Siyada — UAE AI Data Shield backend",
   "scripts": {
     "start": "node --env-file=.env src/index.js",
-    "dev":   "node --env-file=.env --watch src/index.js"
+    "dev":   "node --env-file=.env --watch src/index.js",
+    "test":  "node --test 'test/*.test.mjs'"
   },
   "engines": {
     "node": ">=18"

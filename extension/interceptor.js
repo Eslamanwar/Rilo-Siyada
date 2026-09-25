@@ -302,7 +302,7 @@
         <!-- Loading state -->
         <div id="loading">
           <div class="spinner"></div>
-          <div class="loading-text">Siyada is analyzing for UAE PII…</div>
+          <div class="loading-text" id="loadingText">Siyada is analyzing for UAE PII…</div>
         </div>
 
         <!-- Results (hidden until analysis done) -->
@@ -643,6 +643,8 @@
   const VISION_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
   const MAX_ANALYSIS_EDGE  = 1568; // Claude's recommended long edge — larger buys nothing
   const MAX_ANALYSIS_BYTES = 4 * 1024 * 1024;
+  const BOX_PAD_RATIO      = 0.18;  // grow each box by 18% of its own size
+  const MIN_BOX_PAD_PX     = 8;     // …and never by less than 8px
 
   let imageReview  = null; // { results, allFiles, reinject }
   let scanningImage = false;
@@ -688,6 +690,19 @@
     return { base64: b64, mediaType: 'image/jpeg', bitmap };
   }
 
+  // A model's box is approximate: it clips ascenders, stops short of the last
+  // digit, drifts a few percent. Grow every box before burning it in.
+  function padBox(box, w, h) {
+    const [x, y, bw, bh] = box;
+    const padX = Math.max(bw * BOX_PAD_RATIO, MIN_BOX_PAD_PX / w);
+    const padY = Math.max(bh * BOX_PAD_RATIO, MIN_BOX_PAD_PX / h);
+    const x0 = Math.max(0, x - padX);
+    const y0 = Math.max(0, y - padY);
+    const x1 = Math.min(1, x + bw + padX);
+    const y1 = Math.min(1, y + bh + padY);
+    return [x0, y0, x1 - x0, y1 - y0];
+  }
+
   // Burn opaque boxes over every located finding, at full resolution.
   async function maskImageFile(file, items) {
     const bitmap = await createImageBitmap(file);
@@ -703,7 +718,7 @@
 
     for (const item of items) {
       if (!item.box) continue;
-      const [x, y, w, h] = item.box;
+      const [x, y, w, h] = padBox(item.box, bitmap.width, bitmap.height);
       const px = x * bitmap.width;
       const py = y * bitmap.height;
       const pw = w * bitmap.width;
@@ -720,6 +735,28 @@
     const blob = await canvasToBlob(canvas, 'image/png');
     const stem = (file.name || 'image').replace(/\.[^.]+$/, '');
     return new File([blob], `siyada-masked-${stem}.png`, { type: 'image/png' });
+  }
+
+  function showMaskingProgress() {
+    shadow.getElementById('imgResults').style.display = 'none';
+    shadow.getElementById('loadingText').textContent = 'Masking and re-checking the copy…';
+    shadow.getElementById('loading').classList.add('visible');
+    shadow.getElementById('panel').classList.add('visible');
+    setBadge('scanning');
+  }
+
+  function showMaskFailure(count) {
+    shadow.getElementById('loading').classList.remove('visible');
+    shadow.getElementById('imgResults').style.display = 'block';
+    shadow.getElementById('imgAlert').className = 'alert critical';
+    shadow.getElementById('imgAlertText').textContent =
+      `${count} image${count !== 1 ? 's' : ''} still readable after masking — not attached`;
+    shadow.getElementById('imgSummary').textContent =
+      'The masked copy was re-read and sensitive data was still visible, so it was dropped.';
+    shadow.getElementById('imgMaskBtn').style.display = 'none';
+    shadow.getElementById('imgNote').textContent =
+      'Crop or redact the image yourself before attaching it.';
+    shadow.getElementById('panel').classList.add('visible');
   }
 
   function showImageLoading() {
@@ -739,12 +776,14 @@
     const ctx = canvas.getContext('2d');
     ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
 
+    // Opaque, like the real mask: a see-through preview reads as a failed
+    // redaction, and the padded box is what actually gets covered.
     ctx.lineWidth   = 2;
     ctx.strokeStyle = '#FF3B3B';
-    ctx.fillStyle   = 'rgba(255,59,59,.28)';
+    ctx.fillStyle   = '#000000';
     for (const item of items) {
       if (!item.box) continue;
-      const [x, y, w, h] = item.box;
+      const [x, y, w, h] = padBox(item.box, bitmap.width, bitmap.height);
       const px = x * canvas.width;
       const py = y * canvas.height;
       const pw = w * canvas.width;
@@ -778,7 +817,7 @@
     const maskable = flagged.every(r => r.analysis.maskable);
     shadow.getElementById('imgMaskBtn').style.display = maskable ? '' : 'none';
     shadow.getElementById('imgNote').textContent = maskable
-      ? 'Masking burns the marked regions out of the file itself — the original never leaves this browser.'
+      ? 'Preview only — masking burns these regions out of the file, then re-reads the copy to confirm nothing is still legible.'
       : 'The model could not locate every finding precisely, so a masked copy is not offered for this image.';
 
     shadow.getElementById('imgItems').innerHTML = items.map(item => {
@@ -820,19 +859,52 @@
       return;
     }
 
-    // mask: clean images pass through untouched, flagged ones are masked
+    // mask: clean images pass through untouched, flagged ones are masked —
+    // then re-read to prove the redaction actually landed on the data.
+    showMaskingProgress();
     const approved = [];
+    let unverified = 0;
     for (const file of review.allFiles) {
       const result = review.results.find(r => r.file === file);
       if (!result || !result.analysis.hasPII) { approved.push(file); continue; }
-      if (!result.analysis.maskable) continue; // cannot be masked — dropped
+      if (!result.analysis.maskable) { unverified++; continue; }
       try {
-        approved.push(await maskImageFile(file, result.analysis.items || []));
-      } catch { /* drop the image rather than attach it unmasked */ }
+        const masked = await maskImageFile(file, result.analysis.items || []);
+        if (await maskHolds(masked)) approved.push(masked);
+        else unverified++;
+      } catch {
+        unverified++; // drop the image rather than attach it unmasked
+      }
     }
-    logImageEvent(review, 'masked');
+
+    logImageEvent(review, unverified ? 'mask_failed' : 'masked');
     if (approved.length) review.reinject(approved);
+
+    if (unverified) {
+      showMaskFailure(unverified);
+      setBadge('danger');
+      return;
+    }
+    shadow.getElementById('panel').classList.remove('visible');
     setBadge('safe');
+  }
+
+  // Send the masked copy back through the same agent. Anything still readable
+  // comes back flagged, and the copy is dropped instead of attached.
+  async function maskHolds(maskedFile) {
+    try {
+      const { base64, mediaType } = await prepareForAnalysis(maskedFile);
+      const res = await fetch(`${SIYADA_API}/analyze-image`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ imageBase64: base64, mediaType }),
+        signal:  AbortSignal.timeout(60_000),
+      });
+      if (!res.ok) return false;
+      return !(await res.json()).hasPII;
+    } catch {
+      return false; // unverified means blocked, same as everywhere else
+    }
   }
 
   function logImageEvent(review, outcome) {
