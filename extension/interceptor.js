@@ -807,7 +807,11 @@
     imageReview = null;
     shadow.getElementById('panel').classList.remove('visible');
 
-    if (choice === 'discard') { setBadge('safe'); return; }
+    if (choice === 'discard') {
+      logImageEvent(review, 'discarded');
+      setBadge('safe');
+      return;
+    }
 
     if (choice === 'override') {
       logImageEvent(review, 'override');
