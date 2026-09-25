@@ -168,8 +168,68 @@ Use `POLICY_FILE=/etc/siyada/policy.yaml` to point at a policy outside the repo
 
 ```bash
 curl localhost:3000/policy            # active policy, hash, load error
-cd server && npm test                 # policy engine + masking geometry
+cd server && npm test                 # policy engine, ledger, masking geometry
 ```
+
+## Audit Ledger and Evidence Packs
+
+A compliance log that can be edited is a log nobody has to believe. Every
+decision — each analysis, each release, each *refused* release — is appended to
+`server/data/ledger.jsonl`, and each entry commits to the one before it:
+
+```
+hash(n) = sha256( seq | ts | hash(n-1) | canonical(event) )
+seal(n) = hmac-sha256( install key, hash(n) )
+```
+
+Change, reorder or delete one entry and every entry after it stops verifying.
+The chain itself is plain SHA-256, so an auditor holding the file and no secret
+can recompute it; the seal means that rewriting the *whole* chain — the one
+attack a public hash chain does not stop — also needs the install key
+(`SIYADA_LEDGER_KEY`, or a `0600` file generated next to the ledger on first
+run).
+
+**The ledger is not a second copy of the leak.** An entry records the finding's
+type, class, severity, regulation, placeholder and a keyed fingerprint of the
+value — never the value, the prompt or the image. `append` walks the event and
+refuses anything still carrying raw content, so a future careless caller cannot
+turn the audit trail into the breach. The fingerprint is an HMAC, so the same
+Emirates ID is traceable across entries within one install and meaningless
+outside it.
+
+**An unrecordable decision is not a decision.** If the append fails, `/analyze`,
+`/analyze-image` and `/release` answer `503 ledger_unavailable` rather than
+letting an unlogged release happen — the same fail-closed rule the policy
+engine follows.
+
+An **evidence pack** is what leaves the building: a time-ranged slice of the
+chain plus everything needed to check it without this server running — the link
+the slice hangs off (`startsAfter`), the chain head it ends at, the governing
+policy and its hash, and a sealed manifest over the whole document.
+
+```bash
+curl 'localhost:3000/evidence?from=2026-09-01&to=2026-09-30&case=DPA-114&requestedBy=dpo@ehs.gov.ae' -o pack.json
+
+node server/tools/verify-evidence.js pack.json                 # chain + manifest
+node server/tools/verify-evidence.js pack.json --key $KEY      # + seals
+```
+
+```
+chain    : intact
+seals    : valid
+manifest : matches
+
+VERIFIED
+```
+
+Editing a record, dropping an inconvenient one, or rewriting the case number
+all fail the check and name the entry that broke.
+
+A host that can rewrite the ledger can also rewrite its own head, so for
+non-repudiation against the operator, publish the head somewhere the operator
+does not control — `GET /ledger/head` returns `{ seq, hash }` for a daily anchor
+into a ticket, a signed email, or a notary service. Any pack whose head predates
+the anchor is checkable against it.
 
 ## Backend / Vision Agent
 
@@ -183,6 +243,9 @@ cd server && npm start          # http://localhost:3000, dashboard at /
 | `POST /analyze-image` | Image analysis — `{ imageBase64, mediaType }` |
 | `POST /release` | Release the original — `{ decisionId, justification, requester, approvals }` |
 | `GET /policy` | Active policy, its hash, and any load error |
+| `GET /ledger/verify` | Recompute the audit chain; `409` and the first break if tampered |
+| `GET /ledger/head` | Current head `{ seq, hash }` — anchor this off-host |
+| `GET /evidence` | Sealed evidence pack — `?from=&to=&case=&requestedBy=` |
 | `GET /stats` | Compliance events (text + image channels, policy action per event) |
 | `GET /health` | Model, region, active vision engine, policy hash |
 
@@ -253,6 +316,12 @@ His phone is +971-50-1234567. What medication should I prescribe?
 
 ```
 siyada-policy.yaml     Organisational policy — the DPO edits this, not the code
+server/
+  src/index.js         HTTP routes, agents, dashboard
+  src/policy.js        Policy engine — classes, actions, release checks
+  src/ledger.js        Hash-chained audit ledger and evidence packs
+  tools/verify-evidence.js  Offline pack verifier (no server, no network)
+  data/ledger.jsonl    The chain itself (gitignored, created on first run)
 extension/
   manifest.json        Chrome extension manifest (MV3)
   lib/scanner.js       Live badge hint — keywords + credential prefixes (AKIA, ghp_, PEM)
@@ -268,6 +337,7 @@ extension/
 
 - [x] Image/screenshot scanning (vision agent, bounding-box masking)
 - [x] Policy as code with justification and break-glass dual approval
+- [x] Hash-chained audit ledger with sealed, offline-verifiable evidence packs
 - [ ] Signed sector policy packs (PDPL, DHA/MOH, CBUAE, DIFC/ADGM)
 - [ ] Voice call monitoring (Sensor 2)
 - [ ] Jetson Orin Nano vision service behind `VISION_URL`

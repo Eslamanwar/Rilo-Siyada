@@ -6,6 +6,9 @@
  *   POST /analyze-image  → { imageBase64, mediaType } → vision PII agent → { hasPII, items, boxes, policy, ... }
  *   POST /release        → { decisionId, justification, approvals } → grant or refusal for the original data
  *   GET  /policy         → the active policy, its hash, and any load error
+ *   GET  /ledger/verify  → recompute the audit chain and report the first break
+ *   GET  /ledger/head    → current head hash, for anchoring outside this host
+ *   GET  /evidence       → sealed, offline-verifiable evidence pack for a time range
  *   GET  /health         → service health
  *   GET  /               → simple dashboard HTML
  *
@@ -17,7 +20,8 @@ import { createServer }         from 'node:http';
 import { createHash, createHmac } from 'node:crypto';
 import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath }          from 'node:url';
-import { evaluate, checkRelease, loadPolicy, watchPolicy, getPolicy, RELEASE_WINDOW_MS } from './policy.js';
+import { evaluate, checkRelease, classify, loadPolicy, watchPolicy, getPolicy, RELEASE_WINDOW_MS } from './policy.js';
+import { openLedger, getLedger } from './ledger.js';
 import { scanSecrets, redactSecrets, mergeFindings } from './secrets.js';
 
 const PORT          = Number(process.env.PORT || 3200);
@@ -49,8 +53,14 @@ const CORS_HEADERS = {
 };
 
 // ─── In-memory compliance log ────────────────────────────────────────────────
+// The dashboard reads this; the durable record is the hash-chained ledger below.
 const events = [];
 const MAX_EVENTS = 500;
+
+// ─── Audit ledger ────────────────────────────────────────────────────────────
+const LEDGER_FILE = resolvePath(
+  process.env.LEDGER_FILE || fileURLToPath(new URL('../data/ledger.jsonl', import.meta.url)),
+);
 
 // ─── Policy as code ──────────────────────────────────────────────────────────
 const POLICY_FILE = resolvePath(
@@ -65,6 +75,40 @@ function recordDecision(decision) {
   const cutoff = Date.now() - RELEASE_WINDOW_MS;
   for (const [id, d] of decisions) if (d.issuedAt < cutoff) decisions.delete(id);
   return decision;
+}
+
+/**
+ * Record one event in both logs.
+ *
+ * The ledger append is the part that must not fail quietly: a decision nobody
+ * can prove was made is not a decision this service is willing to hand back,
+ * so callers turn a throw here into a 503 rather than answering anyway.
+ */
+function record(event, ledgerEvent) {
+  const entry = getLedger().append(ledgerEvent);
+  events.unshift({ ...event, ledgerSeq: entry.seq, ledgerHash: entry.hash });
+  if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+  return entry;
+}
+
+// Findings go to disk as class, severity and a keyed fingerprint — never the value.
+function ledgerFindings(items) {
+  const ledger = getLedger();
+  return (items || []).map(item => ({
+    type:        item.type,
+    class:       classify(item.type) || 'unclassified',
+    severity:    item.severity || null,
+    regulation:  item.regulation || null,
+    placeholder: item.masked || null,
+    fingerprint: ledger.fingerprint(item.value ?? ''),
+  }));
+}
+
+function parseTime(raw, fallback = null) {
+  if (raw === null || raw === undefined || raw === '') return fallback;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? fallback : parsed;
 }
 
 // ─── AWS SigV4 helpers ───────────────────────────────────────────────────────
@@ -514,14 +558,21 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
                 border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 12px; color: #8B949E; }
   .policy-bar code { color: #E6EDF3; }
   .policy-bad { border-left-color: #FF6B6B; color: #FF6B6B; }
+  .ledger-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .ledger-bar .spacer { flex: 1; }
+  .btn { background: #21262D; color: #E6EDF3; border: 1px solid #30363D; border-radius: 6px;
+         padding: 6px 12px; font-size: 12px; text-decoration: none; }
+  .btn:hover { border-color: #00D4AA; color: #00D4AA; }
+  .seq { color: #8B949E; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <h1>🛡️ Siyada — سيادة</h1>
 <p class="sub">UAE AI Compliance Dashboard</p>
 <div class="policy-bar" id="policyBar"></div>
+<div class="policy-bar ledger-bar" id="ledgerBar"></div>
 <div class="stats" id="stats"></div>
-<table><thead><tr><th>Time</th><th>Channel</th><th>Severity</th><th>PII Types</th><th>Policy</th><th>Summary</th></tr></thead>
+<table><thead><tr><th>#</th><th>Time</th><th>Channel</th><th>Severity</th><th>PII Types</th><th>Policy</th><th>Summary</th></tr></thead>
 <tbody id="tbody"></tbody></table>
 <script>
 async function load() {
@@ -539,8 +590,18 @@ async function load() {
   bar.innerHTML = d.policy.error
     ? 'Policy not enforceable — ' + d.policy.error
     : 'Governed by <code>' + d.policy.organization + '</code> policy <code>' + d.policy.hash + '</code>';
+  const led = document.getElementById('ledgerBar');
+  led.className = 'policy-bar ledger-bar' + (d.ledger.ok ? '' : ' policy-bad');
+  led.innerHTML = (d.ledger.ok
+      ? 'Audit chain intact — ' + d.ledger.count + ' entries, head <code>' + d.ledger.headHash.slice(0, 16) + '</code>'
+      : 'AUDIT CHAIN BROKEN at entry ' + (d.ledger.brokenAt ? d.ledger.brokenAt.seq + ' — ' + d.ledger.brokenAt.reason : '?')) +
+    '<span class="spacer"></span>' +
+    '<a class="btn" href="/evidence?from=' + (Date.now() - 86400000) + '">Evidence pack · 24h</a>' +
+    '<a class="btn" href="/evidence">Evidence pack · all</a>' +
+    '<a class="btn" href="/ledger/verify" target="_blank">Verify chain</a>';
   document.getElementById('tbody').innerHTML = d.events.map(e =>
-    '<tr><td>'+new Date(e.ts).toLocaleTimeString()+'</td>' +
+    '<tr><td class="seq">'+(e.seq ?? '—')+'</td>' +
+    '<td>'+new Date(e.ts).toLocaleTimeString()+'</td>' +
     '<td>'+(e.src === 'image' ? '🖼️ image' : '💬 text')+'</td>' +
     '<td><span class="badge '+e.sev+'">'+e.sev+'</span></td>' +
     '<td>'+e.types+'</td>' +
@@ -572,6 +633,7 @@ const server = createServer(async (req, res) => {
       region:  AWS_REGION,
       vision:  VISION_URL ? 'local' : 'bedrock',
       policy:  { hash: getPolicy().hash, version: getPolicy().policy.version, error: getPolicy().error },
+      ledger:  { file: LEDGER_FILE, ...getLedger().verifyCached() },
       total:   events.length,
     });
     return;
@@ -594,8 +656,10 @@ const server = createServer(async (req, res) => {
       images:   events.filter(e => e.source === 'image').length,
       released: events.filter(e => e.outcome === 'released').length,
       policy:   { organization: getPolicy().policy.organization, hash: getPolicy().hash, error: getPolicy().error },
+      ledger:   getLedger().verifyCached(),
       events:   events.slice(0, 50).map(e => ({
         ts:      e.timestamp,
+        seq:     e.ledgerSeq ?? null,
         src:     e.source || 'text',
         sev:     e.severity || 'medium',
         types:   (e.items || []).map(i => i.type).join(', ') || '—',
@@ -638,20 +702,43 @@ const server = createServer(async (req, res) => {
       const healthKeywords = ['patient','diagnosis','medication','treatment','hospital','clinic','مريض','تشخيص'];
       const financialKeywords = ['account','balance','transaction','iban','bank','حساب'];
       const lowerText = text.toLowerCase();
-      events.unshift({
-        timestamp:       Date.now(),
-        source:          'text',
-        severity:        highestSeverity(result.items),
-        items:           result.items || [],
-        hasHealthData:   healthKeywords.some(k => lowerText.includes(k)),
-        hasFinancialData:financialKeywords.some(k => lowerText.includes(k)),
-        summary:         result.summary || '',
-        regulations:     result.regulations || [],
-        policyAction:    result.policy.action,
-        policyHash:      result.policy.policyHash,
-        decisionId:      result.policy.id,
-      });
-      if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+      const severity  = highestSeverity(result.items);
+      const health    = healthKeywords.some(k => lowerText.includes(k));
+      const financial = financialKeywords.some(k => lowerText.includes(k));
+
+      try {
+        record({
+          timestamp:       Date.now(),
+          source:          'text',
+          severity,
+          items:           result.items || [],
+          hasHealthData:   health,
+          hasFinancialData:financial,
+          summary:         result.summary || '',
+          regulations:     result.regulations || [],
+          policyAction:    result.policy.action,
+          policyHash:      result.policy.policyHash,
+          decisionId:      result.policy.id,
+        }, {
+          kind:             'analysis',
+          channel:          'text',
+          severity,
+          findings:         ledgerFindings(result.items),
+          findingCount:     (result.items || []).length,
+          hasHealthData:    health,
+          hasFinancialData: financial,
+          regulations:      result.regulations || [],
+          policyAction:     result.policy.action,
+          policyHash:       result.policy.policyHash,
+          policyVersion:    result.policy.policyVersion,
+          organization:     result.policy.organization,
+          decisionId:       result.policy.id,
+          engine:           `bedrock:${BEDROCK_MODEL}`,
+        });
+      } catch (err) {
+        sendJson(res, 503, { error: 'ledger_unavailable', message: String(err?.message ?? err) });
+        return;
+      }
     }
 
     sendJson(res, 200, result);
@@ -699,20 +786,44 @@ const server = createServer(async (req, res) => {
       const typeText = result.items.map(i => `${i.type} ${i.value}`).join(' ').toLowerCase();
       const healthKeywords    = ['patient','diagnosis','medical','prescription','lab','hospital','clinic','مريض','تشخيص'];
       const financialKeywords = ['iban','bank','card','account','cheque','statement','حساب'];
-      events.unshift({
-        timestamp:        Date.now(),
-        source:           'image',
-        severity:         highestSeverity(result.items),
-        items:            result.items.map(({ box: _box, ...rest }) => rest),
-        hasHealthData:    healthKeywords.some(k => typeText.includes(k)),
-        hasFinancialData: financialKeywords.some(k => typeText.includes(k)),
-        summary:          result.summary,
-        regulations:      result.regulations,
-        policyAction:     result.policy.action,
-        policyHash:       result.policy.policyHash,
-        decisionId:       result.policy.id,
-      });
-      if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+      const severity  = highestSeverity(result.items);
+      const health    = healthKeywords.some(k => typeText.includes(k));
+      const financial = financialKeywords.some(k => typeText.includes(k));
+
+      try {
+        record({
+          timestamp:        Date.now(),
+          source:           'image',
+          severity,
+          items:            result.items.map(({ box: _box, ...rest }) => rest),
+          hasHealthData:    health,
+          hasFinancialData: financial,
+          summary:          result.summary,
+          regulations:      result.regulations,
+          policyAction:     result.policy.action,
+          policyHash:       result.policy.policyHash,
+          decisionId:       result.policy.id,
+        }, {
+          kind:             'analysis',
+          channel:          'image',
+          severity,
+          findings:         ledgerFindings(result.items),
+          findingCount:     result.items.length,
+          maskable:         result.maskable,
+          hasHealthData:    health,
+          hasFinancialData: financial,
+          regulations:      result.regulations || [],
+          policyAction:     result.policy.action,
+          policyHash:       result.policy.policyHash,
+          policyVersion:    result.policy.policyVersion,
+          organization:     result.policy.organization,
+          decisionId:       result.policy.id,
+          engine:           result.engine,
+        });
+      } catch (err) {
+        sendJson(res, 503, { error: 'ledger_unavailable', message: String(err?.message ?? err) });
+        return;
+      }
     }
 
     sendJson(res, 200, result);
@@ -723,6 +834,47 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/policy') {
     const { policy, hash, path, error } = getPolicy();
     sendJson(res, error ? 503 : 200, { policy, hash, path, error });
+    return;
+  }
+
+  // ── GET /ledger/verify — recompute the chain from disk ─────────────────────
+  if (req.method === 'GET' && url.pathname === '/ledger/verify') {
+    const result = getLedger().verify();
+    sendJson(res, result.ok ? 200 : 409, { file: LEDGER_FILE, ...result });
+    return;
+  }
+
+  // ── GET /ledger/head — publish this somewhere the host cannot rewrite ─────
+  if (req.method === 'GET' && url.pathname === '/ledger/head') {
+    const ledger = getLedger();
+    sendJson(res, 200, { seq: ledger.seq, hash: ledger.head, keyId: ledger.keyId, at: new Date().toISOString() });
+    return;
+  }
+
+  // ── GET /evidence — sealed pack for a time range, verifiable offline ─────
+  if (req.method === 'GET' && url.pathname === '/evidence') {
+    const from = parseTime(url.searchParams.get('from'), null);
+    const to   = parseTime(url.searchParams.get('to'),   null);
+    if (url.searchParams.get('from') && from === null) { sendJson(res, 400, { error: 'invalid_from' }); return; }
+    if (url.searchParams.get('to')   && to   === null) { sendJson(res, 400, { error: 'invalid_to' }); return; }
+
+    const pack = getLedger().evidencePack({
+      from,
+      to,
+      caseId:      url.searchParams.get('case') || '',
+      requestedBy: url.searchParams.get('requestedBy') || '',
+      policy:      getPolicy(),
+    });
+
+    const name    = `siyada-evidence-${pack.caseId || 'all'}-${pack.manifest.packHash.slice(0, 8)}.json`;
+    const payload = JSON.stringify(pack, null, 2);
+    res.writeHead(200, {
+      ...CORS_HEADERS,
+      'Content-Type':        'application/json',
+      'Content-Disposition': `attachment; filename="${name}"`,
+      'Content-Length':      Buffer.byteLength(payload),
+    });
+    res.end(payload);
     return;
   }
 
@@ -740,22 +892,40 @@ const server = createServer(async (req, res) => {
     });
 
     // Refusals are logged too — an attempted release is the interesting event.
-    events.unshift({
-      timestamp:    Date.now(),
-      source:       decision?.channel || 'release',
-      severity:     'high',
-      items:        [],
-      summary:      verdict.granted
-        ? `Original released under ${decision.action}: ${verdict.justification || ''}`
-        : `Release refused (${verdict.error})`,
-      policyAction: decision?.action || 'unknown',
-      policyHash:   decision?.policyHash || 'none',
-      decisionId:   body.decisionId || null,
-      outcome:      verdict.granted ? 'released' : 'refused',
-      justification: verdict.justification || '',
-      approvedBy:   verdict.approvedBy || [],
-    });
-    if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+    try {
+      record({
+        timestamp:    Date.now(),
+        source:       decision?.channel || 'release',
+        severity:     'high',
+        items:        [],
+        summary:      verdict.granted
+          ? `Original released under ${decision.action}: ${verdict.justification || ''}`
+          : `Release refused (${verdict.error})`,
+        policyAction: decision?.action || 'unknown',
+        policyHash:   decision?.policyHash || 'none',
+        decisionId:   body.decisionId || null,
+        outcome:      verdict.granted ? 'released' : 'refused',
+        justification: verdict.justification || '',
+        approvedBy:   verdict.approvedBy || [],
+      }, {
+        kind:          'release',
+        channel:       decision?.channel || 'release',
+        outcome:       verdict.granted ? 'released' : 'refused',
+        refusalReason: verdict.granted ? null : verdict.error,
+        policyAction:  decision?.action || 'unknown',
+        policyHash:    decision?.policyHash || 'none',
+        policyVersion: decision?.policyVersion ?? null,
+        organization:  decision?.organization ?? null,
+        decisionId:    body.decisionId || null,
+        requester:     String(body.requester || ''),
+        justification: verdict.justification || '',
+        approvedBy:    verdict.approvedBy || [],
+      });
+    } catch (err) {
+      // An unrecordable release is not a release.
+      sendJson(res, 503, { error: 'ledger_unavailable', message: String(err?.message ?? err) });
+      return;
+    }
 
     if (verdict.granted) decisions.delete(decision.id); // one grant per decision
     sendJson(res, verdict.granted ? 200 : 403, verdict);
@@ -791,6 +961,8 @@ const server = createServer(async (req, res) => {
   sendJson(res, 404, { error: 'not_found' });
 });
 
+const ledgerState = openLedger(LEDGER_FILE).integrity;
+
 loadPolicy(POLICY_FILE);
 watchPolicy(POLICY_FILE, ({ hash, error }) => {
   console.log(error ? `  policy : RELOAD FAILED — ${error}` : `  policy : reloaded (${hash})`);
@@ -800,6 +972,8 @@ server.listen(PORT, () => {
   const { hash, error } = getPolicy();
   console.log(`Siyada backend listening on http://localhost:${PORT}`);
   console.log(`  policy : ${error ? `UNENFORCEABLE — ${error}` : `${POLICY_FILE} (${hash})`}`);
+  console.log(`  ledger : ${LEDGER_FILE} — ${ledgerState.count} entries, ${
+    ledgerState.ok ? `head ${ledgerState.headHash.slice(0, 16)}` : `BROKEN at ${ledgerState.brokenAt?.seq}: ${ledgerState.brokenAt?.reason}`}`);
   console.log(`  model  : ${BEDROCK_MODEL}`);
   console.log(`  vision : ${VISION_URL || `bedrock (${BEDROCK_MODEL})`}`);
   console.log(`  region : ${AWS_REGION}`);
