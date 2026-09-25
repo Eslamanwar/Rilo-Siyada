@@ -25,6 +25,9 @@ async function logInterception(event) {
     severity:         event.severity || 'medium',
     hasHealthData:    event.hasHealthData || false,
     hasFinancialData: event.hasFinancialData || false,
+    policyAction:     event.policyAction || '',
+    policyHash:       event.policyHash || '',
+    approvedBy:       event.approvedBy || [],
   });
   // Keep last MAX_LOG_ENTRIES
   if (events.length > MAX_LOG_ENTRIES) events.length = MAX_LOG_ENTRIES;

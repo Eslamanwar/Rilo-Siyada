@@ -287,6 +287,32 @@
       color: #8B949E; font-size: 11px; text-decoration: underline; padding: 4px;
     }
     .btn-override:hover { color: #FF8C61; }
+
+    /* Policy banner + release form */
+    .policy {
+      padding: 8px 16px; font-size: 11px; color: #8B949E;
+      border-top: 1px solid #21262D; display: flex; gap: 6px; align-items: baseline;
+    }
+    .policy-action { font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+    .policy-action.block { color: #FF6B6B; }
+    .policy-action.break_glass { color: #FF8C61; }
+    .policy-action.allow_with_justification { color: #FFD60A; }
+    .policy-action.redact, .policy-action.allow { color: #00D4AA; }
+    .policy-hash { margin-left: auto; font-family: 'Courier New', monospace; color: #484F58; }
+
+    #release { display: none; border-top: 1px solid #21262D; padding: 12px 16px; }
+    #release.visible { display: block; }
+    .release-title { font-size: 11px; font-weight: 700; text-transform: uppercase;
+                     letter-spacing: .5px; color: #FFD60A; margin-bottom: 8px; }
+    #release textarea, #release input {
+      width: 100%; box-sizing: border-box; background: #161B22; color: #E6EDF3;
+      border: 1px solid #30363D; border-radius: 6px; padding: 8px 10px;
+      font-size: 12px; font-family: inherit; margin-bottom: 6px;
+    }
+    #release textarea { min-height: 54px; resize: vertical; }
+    .release-hint { font-size: 11px; color: #8B949E; margin-bottom: 8px; }
+    .release-error { font-size: 11px; color: #FF6B6B; margin-bottom: 8px; min-height: 0; }
+    .release-error:empty { display: none; }
   `;
 
   function createOverlay() {
@@ -321,9 +347,13 @@
           <div class="fine">
             Sending may violate <strong id="topReg"></strong> — fine up to <strong>AED 2,000,000</strong>
           </div>
+          <div class="policy" id="textPolicy" style="display:none"></div>
           <div class="actions">
             <button class="btn btn-block"  id="blockBtn">✕ Keep Editing</button>
             <button class="btn btn-redact" id="redactBtn">🛡️ Show Redacted</button>
+          </div>
+          <div class="override" id="textReleaseRow" style="display:none">
+            <button class="btn-override" id="textReleaseBtn"></button>
           </div>
           <div id="preview">
             <div class="preview-label">✅ Redacted version — safe to send</div>
@@ -357,8 +387,26 @@
             <button class="btn btn-block"  id="imgDiscardBtn">✕ Discard Image</button>
             <button class="btn btn-redact" id="imgMaskBtn">🛡️ Attach Masked Copy</button>
           </div>
-          <div class="override">
+          <div class="policy" id="imgPolicy" style="display:none"></div>
+          <div class="override" id="imgOverrideRow">
             <button class="btn-override" id="imgOverrideBtn">Attach original anyway — recorded as a policy override</button>
+          </div>
+        </div>
+
+        <!-- Release request (justification / break-glass), shared by both panels -->
+        <div id="release">
+          <div class="release-title" id="releaseTitle"></div>
+          <textarea id="releaseJust" placeholder="Why does this need to leave the organisation?"></textarea>
+          <div id="releaseApprovals" style="display:none">
+            <input id="releaseRequester" placeholder="Your work email (the requester)">
+            <input id="releaseApprover1" placeholder="First approver">
+            <input id="releaseApprover2" placeholder="Second approver">
+          </div>
+          <div class="release-hint" id="releaseHint"></div>
+          <div class="release-error" id="releaseError"></div>
+          <div class="preview-actions">
+            <button class="btn-send" id="releaseSubmit">Request release</button>
+            <button class="btn-copy" id="releaseCancel">Cancel</button>
           </div>
         </div>
       </div>
@@ -399,6 +447,18 @@
       setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
     });
     badge.addEventListener('click', () => panel.classList.toggle('visible'));
+
+    // ── Policy release (justification / break-glass) ────────────────────────
+    shadow.getElementById('textReleaseBtn').addEventListener('click', () => {
+      if (!pendingData?.decision) return;
+      openRelease(pendingData.decision, verdict => {
+        logTextRelease(pendingData.decision, verdict);
+        injectAndSend(pendingData.inputEl, pendingData.originalText);
+        panel.classList.remove('visible');
+      });
+    });
+    shadow.getElementById('releaseSubmit').addEventListener('click', () => { submitRelease(); });
+    shadow.getElementById('releaseCancel').addEventListener('click', closeRelease);
 
     // ── Image review actions ────────────────────────────────────────────────
     shadow.getElementById('imgCloseBtn').addEventListener('click',    () => resolveImageReview('discard'));
@@ -524,8 +584,14 @@
 
     const { items = [], summary = '', regulations = [] } = analysis;
     const severity = items[0]?.severity || 'medium';
+    const decision = analysis.policy || null;
 
-    pendingData = { inputEl, redactedText: analysis.redactedText || '' };
+    pendingData = {
+      inputEl,
+      redactedText: analysis.redactedText || '',
+      originalText: getInputText(inputEl),
+      decision,
+    };
 
     // Alert banner
     const banner = shadow.getElementById('alertBanner');
@@ -555,7 +621,30 @@
     // Top regulation
     shadow.getElementById('topReg').textContent = regulations[0] || items[0]?.regulation || 'UAE PDPL';
 
+    applyTextPolicy(decision);
     setBadge('danger');
+  }
+
+  // What the panel offers is whatever the decision allows — nothing more.
+  function applyTextPolicy(decision) {
+    const releaseRow = shadow.getElementById('textReleaseRow');
+    const releaseBtn = shadow.getElementById('textReleaseBtn');
+    const redactBtn  = shadow.getElementById('redactBtn');
+
+    closeRelease();
+    shadow.getElementById('preview').classList.remove('visible');
+    renderPolicy(shadow.getElementById('textPolicy'), decision);
+
+    const action = decision?.action || 'redact';
+    redactBtn.style.display = action === 'block' ? 'none' : '';
+    releaseRow.style.display = 'none';
+
+    if (action === 'allow_with_justification' || action === 'break_glass') {
+      releaseRow.style.display = '';
+      releaseBtn.textContent = action === 'break_glass'
+        ? 'Send the original — break-glass, two approvals required'
+        : 'Send the original — justification required';
+    }
   }
 
   function showClean() {
@@ -599,6 +688,102 @@
     createOverlay();
     const badge = shadow.getElementById('badge');
     if (badge) badge.className = state;
+  }
+
+  // ─── Policy as code ────────────────────────────────────────────────────────
+  // The server decides; the panel only offers what the decision permits. An
+  // action the policy did not grant has no button to press.
+
+  const ACTION_ORDER = ['allow', 'redact', 'allow_with_justification', 'break_glass', 'block'];
+  const ACTION_LABEL = {
+    allow:                    'allowed',
+    redact:                   'redact before sending',
+    allow_with_justification: 'justification required',
+    break_glass:              'break-glass — dual approval',
+    block:                    'blocked',
+  };
+
+  let releaseCtx = null; // { decision, onGranted }
+
+  const strictest = decisions =>
+    decisions.reduce((worst, d) =>
+      ACTION_ORDER.indexOf(d.action) > ACTION_ORDER.indexOf(worst.action) ? d : worst);
+
+  function renderPolicy(el, decision) {
+    if (!decision) { el.style.display = 'none'; return; }
+    el.style.display = 'flex';
+    el.innerHTML =
+      `<span>${esc(decision.organization || 'Policy')}:</span>` +
+      `<span class="policy-action ${esc(decision.action)}">${esc(ACTION_LABEL[decision.action] || decision.action)}</span>` +
+      `<span class="policy-hash">v${esc(decision.policyVersion)} · ${esc(decision.policyHash)}</span>`;
+  }
+
+  function openRelease(decision, onGranted) {
+    releaseCtx = { decision, onGranted };
+    const breakGlass = decision.action === 'break_glass';
+
+    shadow.getElementById('releaseTitle').textContent = breakGlass
+      ? 'Break-glass request'
+      : 'Justification required';
+    shadow.getElementById('releaseApprovals').style.display = breakGlass ? 'block' : 'none';
+    shadow.getElementById('releaseHint').textContent = breakGlass
+      ? `At least ${decision.minApprovals} of: ${decision.approvers.join(', ')}. You cannot approve your own request.`
+      : `At least ${decision.minJustification} characters. Recorded against policy ${decision.policyHash}.`;
+    shadow.getElementById('releaseError').textContent = '';
+    shadow.getElementById('releaseJust').value = '';
+    shadow.getElementById('release').classList.add('visible');
+    shadow.getElementById('releaseJust').focus();
+  }
+
+  function closeRelease() {
+    releaseCtx = null;
+    shadow.getElementById('release').classList.remove('visible');
+  }
+
+  async function submitRelease() {
+    if (!releaseCtx) return;
+    const { decision, onGranted } = releaseCtx;
+    const errorEl = shadow.getElementById('releaseError');
+    errorEl.textContent = '';
+
+    const approvals = decision.action === 'break_glass'
+      ? [shadow.getElementById('releaseApprover1').value, shadow.getElementById('releaseApprover2').value]
+          .map(v => v.trim()).filter(Boolean)
+      : [];
+
+    let verdict;
+    try {
+      const res = await fetch(`${SIYADA_API}/release`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          decisionId:    decision.id,
+          justification: shadow.getElementById('releaseJust').value,
+          requester:     shadow.getElementById('releaseRequester').value,
+          approvals,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      verdict = await res.json();
+    } catch (err) {
+      // No answer from the policy server is a refusal, not a pass.
+      errorEl.textContent = `Policy server unreachable — release refused (${err?.message || 'network error'})`;
+      return;
+    }
+
+    if (!verdict.granted) {
+      errorEl.textContent = {
+        justification_required: `Justification too short — at least ${verdict.minLength} characters.`,
+        approval_required:      `${verdict.received ?? 0} of ${verdict.required} approvals from ${(verdict.approvers || []).join(', ')}.`,
+        decision_expired:       'This decision expired. Send again to get a fresh one.',
+        blocked_by_policy:      'Policy blocks this release outright.',
+        unknown_decision:       'The server no longer holds this decision. Send again.',
+      }[verdict.error] || `Release refused (${verdict.error}).`;
+      return;
+    }
+
+    closeRelease();
+    onGranted(verdict);
   }
 
   function esc(str) {
@@ -836,13 +1021,56 @@
     shadow.getElementById('imgTopReg').textContent =
       first.analysis.regulations?.[0] || items[0]?.regulation || 'UAE PDPL';
 
+    applyImagePolicy(review, maskable);
+
     shadow.getElementById('panel').classList.add('visible');
     setBadge('danger');
+  }
+
+  // An image cannot be partly released, so the strictest decision across the
+  // batch governs the whole attachment.
+  function applyImagePolicy(review, maskable) {
+    const found = review.results.map(r => r.analysis.policy).filter(Boolean);
+    const decision = found.length ? strictest(found) : null;
+    review.decision = decision;
+
+    closeRelease();
+    renderPolicy(shadow.getElementById('imgPolicy'), decision);
+
+    const action = decision?.action || 'redact';
+    const overrideRow = shadow.getElementById('imgOverrideRow');
+    const overrideBtn = shadow.getElementById('imgOverrideBtn');
+
+    // Under `block` the original never leaves, and neither does a derived copy.
+    if (action === 'block') {
+      overrideRow.style.display = 'none';
+      shadow.getElementById('imgMaskBtn').style.display = 'none';
+      shadow.getElementById('imgNote').textContent =
+        `Policy ${decision.policyHash} blocks this class of image outright — discard is the only option.`;
+      return;
+    }
+
+    overrideRow.style.display = '';
+    overrideBtn.textContent =
+      action === 'break_glass'      ? 'Attach the original — break-glass, two approvals required'
+    : action === 'allow_with_justification' ? 'Attach the original — justification required'
+    : 'Attach original anyway — recorded as a policy override';
+    if (!maskable) shadow.getElementById('imgMaskBtn').style.display = 'none';
   }
 
   async function resolveImageReview(choice) {
     const review = imageReview;
     if (!review) return;
+
+    // The original only leaves once the server has granted a release.
+    const action = review.decision?.action;
+    if (choice === 'override' && (action === 'allow_with_justification' || action === 'break_glass')) {
+      openRelease(review.decision, () => resolveImageReview('override:granted'));
+      return;
+    }
+    if (choice === 'override' && action === 'block') return;
+    if (choice === 'override:granted') choice = 'override';
+
     imageReview = null;
     shadow.getElementById('panel').classList.remove('visible');
 
@@ -907,6 +1135,21 @@
     }
   }
 
+  function logTextRelease(decision, verdict) {
+    chrome.runtime.sendMessage({
+      type:      'SIYADA_INTERCEPTION',
+      source:    'text',
+      outcome:   decision.action === 'break_glass' ? 'break_glass' : 'justified',
+      items:     [],
+      url:       location.href,
+      timestamp: Date.now(),
+      severity:  'high',
+      policyAction: decision.action,
+      policyHash:   decision.policyHash,
+      approvedBy:   verdict.approvedBy || [],
+    }).catch(() => {});
+  }
+
   function logImageEvent(review, outcome) {
     const items = review.results.flatMap(r => r.analysis.items || []);
     chrome.runtime.sendMessage({
@@ -917,6 +1160,8 @@
       url:       location.href,
       timestamp: Date.now(),
       severity:  ['critical','high','medium','low'].find(s => items.some(i => i.severity === s)) || 'medium',
+      policyAction: review.decision?.action || '',
+      policyHash:   review.decision?.policyHash || '',
     }).catch(() => {});
   }
 
