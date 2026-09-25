@@ -234,7 +234,9 @@ Treat these as sensitive:
 - Internal or classified government markings and letterheads
 
 For every sensitive finding return a normalized bounding box so the region can be masked before upload.
-Boxes use fractions of the image dimensions, origin at the top-left: x and y are the top-left corner, w and h the size, each between 0 and 1. Be generous — it is better for a box to be slightly too large than to leave part of a number visible.
+Boxes use fractions of the image dimensions, origin at the top-left: x and y are the top-left corner, w and h the size, each between 0 and 1.
+Cover the whole value, not the field label: a box must start before the first character and end after the last one, and be tall enough to include ascenders and descenders. Then widen it further. A box that is too large costs nothing; a box that leaves one digit or one letter visible defeats the entire redaction.
+If you cannot place a box confidently, omit the box field for that finding rather than guessing — a guessed box is worse than none.
 
 Respond ONLY with valid JSON in this exact schema — no markdown, no prose outside the JSON:
 

@@ -55,6 +55,19 @@ AI site receives it.
 
 If the agent is unreachable the image is **not** attached — fail closed.
 
+### Masking is verified, not assumed
+
+A model's bounding box is approximate — it clips a digit, drifts a few percent,
+and the "masked" file still reads. So Siyada does not trust its own redaction:
+
+- every box is grown before it is burned in (18% of its own size, min 8px)
+- the masked copy is sent back through the agent and re-read
+- if anything sensitive is still legible, the copy is **dropped, not attached**,
+  and the event is logged as `mask_failed`
+
+That costs one extra inference per masked image — cheap on a local GPU, and the
+only way "masked" means anything.
+
 Supported: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, up to 5 MiB.
 
 ## Backend / Vision Agent
@@ -108,7 +121,8 @@ A stand-in for that service ships with the repo, so the whole image flow can be
 demoed with no cloud call and no credentials:
 
 ```bash
-node server/tools/mock-vision.js          # MOCK_CLEAN=1 for a clean verdict
+node server/tools/mock-vision.js          # MOCK_CLEAN=1  clean verdict
+                                          # MOCK_STRICT=1 mask verification always fails
 VISION_URL=http://localhost:3999 npm start
 ```
 
