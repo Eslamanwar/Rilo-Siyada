@@ -2,7 +2,7 @@
  * Siyada Backend
  *
  * Routes:
- *   POST /analyze        → { text } → Claude PII agent → { hasPII, items, redactedText, policy, ... }
+ *   POST /analyze        → { text } → secret scanner + Claude PII agent → { hasPII, items, redactedText, policy, ... }
  *   POST /analyze-image  → { imageBase64, mediaType } → vision PII agent → { hasPII, items, boxes, policy, ... }
  *   POST /release        → { decisionId, justification, approvals } → grant or refusal for the original data
  *   GET  /policy         → the active policy, its hash, and any load error
@@ -18,6 +18,7 @@ import { createHash, createHmac } from 'node:crypto';
 import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath }          from 'node:url';
 import { evaluate, checkRelease, loadPolicy, watchPolicy, getPolicy, RELEASE_WINDOW_MS } from './policy.js';
+import { scanSecrets, redactSecrets, mergeFindings } from './secrets.js';
 
 const PORT          = Number(process.env.PORT || 3200);
 // BEDROCK_REGION is used instead of AWS_REGION to avoid conflict with shell env vars
@@ -29,6 +30,12 @@ const BEDROCK_MODEL = process.env.BEDROCK_MODEL  || 'eu.anthropic.claude-haiku-4
 // The endpoint must accept { imageBase64, mediaType, prompt } and return the
 // same JSON schema the vision agent produces.
 const VISION_URL = process.env.VISION_URL || '';
+
+// Pasted source files are long. The secret scanner handles any length; the
+// LLM only sees the first LLM_TEXT_CHARS, so a key buried further down is
+// still caught deterministically.
+const MAX_TEXT_CHARS = 20_000;
+const LLM_TEXT_CHARS = 6_000;
 
 // Bedrock accepts images up to ~5 MB. Base64 inflates by ~4/3.
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -289,10 +296,28 @@ If nothing sensitive is present set hasPII false, items [], regulations [], safe
 // ─── Analyze route ────────────────────────────────────────────────────────────
 
 async function analyzeText(text) {
-  const messages = [{ role: 'user', content: `Analyze this text for UAE PII:\n\n${text}` }];
-  const result   = await callBedrock(messages, PII_SYSTEM_PROMPT);
+  // Exact-shape credentials (AWS keys, tokens, private keys, connection
+  // strings) are found deterministically; the model then covers everything
+  // that has no fixed shape. The two verdicts are merged below.
+  const secrets = scanSecrets(text);
 
-  if (!result.ok) return { ok: false, error: 'bedrock_error', detail: result.detail };
+  const excerpt  = text.length > LLM_TEXT_CHARS ? text.slice(0, LLM_TEXT_CHARS) : text;
+  const messages = [{ role: 'user', content: `Analyze this text for UAE PII:\n\n${excerpt}` }];
+  let result;
+  try {
+    result = await callBedrock(messages, PII_SYSTEM_PROMPT);
+  } catch (err) {
+    if (secrets.length) return secretsOnlyVerdict(text, secrets, `bedrock_unreachable: ${err?.message ?? err}`);
+    throw err;
+  }
+
+  if (!result.ok) {
+    // A key the scanner already found must be reported even when the model is
+    // unavailable — the extension fails closed either way, but the user should
+    // see what was caught and the compliance log should record it.
+    if (secrets.length) return secretsOnlyVerdict(text, secrets, `bedrock_error: ${result.status}`);
+    return { ok: false, error: 'bedrock_error', detail: result.detail };
+  }
 
   // Parse the JSON the LLM returned
   let parsed;
@@ -301,10 +326,46 @@ async function analyzeText(text) {
     const cleaned = result.text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/,'').trim();
     parsed = JSON.parse(cleaned);
   } catch (e) {
+    if (secrets.length) return secretsOnlyVerdict(text, secrets, 'parse_error');
     return { ok: false, error: 'parse_error', raw: result.text, detail: String(e.message) };
   }
 
-  return { ok: true, ...parsed };
+  if (!secrets.length && excerpt === text) return { ok: true, ...parsed };
+
+  const items = mergeFindings(parsed.items, secrets);
+  // The model redacted only what it saw; apply the scanner's masks on top so
+  // every credential is gone from the copy that may be sent.
+  const base  = excerpt === text && typeof parsed.redactedText === 'string' && parsed.redactedText
+    ? parsed.redactedText
+    : redactSecrets(text, parsed.items);
+  const regulations = new Set(Array.isArray(parsed.regulations) ? parsed.regulations : []);
+  for (const s of secrets) regulations.add(s.regulation);
+
+  return {
+    ok:           true,
+    ...parsed,
+    hasPII:       Boolean(parsed.hasPII) || secrets.length > 0,
+    items,
+    redactedText: redactSecrets(base, secrets),
+    regulations:  [...regulations],
+    summary:      secrets.length
+      ? `${secrets.length} credential${secrets.length === 1 ? '' : 's'} found in code (${[...new Set(secrets.map(s => s.type))].join(', ')})` +
+        (parsed.hasPII && parsed.summary ? `; ${parsed.summary}` : '')
+      : parsed.summary,
+    secretScan:   { count: secrets.length, llmTruncated: excerpt !== text },
+  };
+}
+
+function secretsOnlyVerdict(text, secrets, degraded) {
+  return {
+    ok:           true,
+    hasPII:       true,
+    items:        secrets,
+    redactedText: redactSecrets(text, secrets),
+    regulations:  [...new Set(secrets.map(s => s.regulation))],
+    summary:      `${secrets.length} credential${secrets.length === 1 ? '' : 's'} found in code (${[...new Set(secrets.map(s => s.type))].join(', ')}); PII agent unavailable`,
+    secretScan:   { count: secrets.length, llmTruncated: false, degraded },
+  };
 }
 
 // ─── Image analysis ──────────────────────────────────────────────────────────
@@ -554,7 +615,7 @@ const server = createServer(async (req, res) => {
 
     const text = typeof body.text === 'string' ? body.text.trim() : '';
     if (!text) { sendJson(res, 400, { error: 'missing_text' }); return; }
-    if (text.length > 4000) { sendJson(res, 400, { error: 'text_too_long', max: 4000 }); return; }
+    if (text.length > MAX_TEXT_CHARS) { sendJson(res, 400, { error: 'text_too_long', max: MAX_TEXT_CHARS }); return; }
 
     let result;
     try {
