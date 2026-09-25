@@ -2,9 +2,10 @@
  * Siyada Backend
  *
  * Routes:
- *   POST /analyze  → { text } → Claude PII agent → { hasPII, items, redactedText, ... }
- *   GET  /health   → service health
- *   GET  /         → simple dashboard HTML
+ *   POST /analyze        → { text } → Claude PII agent → { hasPII, items, redactedText, ... }
+ *   POST /analyze-image  → { imageBase64, mediaType } → vision PII agent → { hasPII, items, boxes, ... }
+ *   GET  /health         → service health
+ *   GET  /               → simple dashboard HTML
  *
  * Zero npm dependencies. Based on Rilo Tutor server pattern.
  * SigV4-signs every Bedrock request directly.
@@ -17,6 +18,16 @@ const PORT          = Number(process.env.PORT || 3200);
 // BEDROCK_REGION is used instead of AWS_REGION to avoid conflict with shell env vars
 const AWS_REGION    = process.env.BEDROCK_REGION || process.env.AWS_REGION || 'eu-west-1';
 const BEDROCK_MODEL = process.env.BEDROCK_MODEL  || 'eu.anthropic.claude-haiku-4-5-20251001-v1:0';
+
+// Local vision model (Jetson / on-prem GPU). When set, images are analyzed here
+// instead of Bedrock — the request never leaves the local network.
+// The endpoint must accept { imageBase64, mediaType, prompt } and return the
+// same JSON schema the vision agent produces.
+const VISION_URL = process.env.VISION_URL || '';
+
+// Bedrock accepts images up to ~5 MB. Base64 inflates by ~4/3.
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
 // CORS — allow the extension (chrome-extension://*) and localhost for dev
 const CORS_HEADERS = {
@@ -111,13 +122,13 @@ function signAws(creds, { method = 'POST', region, service, host, path, body = '
 
 // ─── Call Bedrock Claude ─────────────────────────────────────────────────────
 
-async function callBedrock(messages, systemPrompt) {
+async function callBedrock(messages, systemPrompt, maxTokens = 1024) {
   const creds   = await getCredentials();
   const host    = `bedrock-runtime.${AWS_REGION}.amazonaws.com`;
   const path    = `/model/${BEDROCK_MODEL}/invoke`;
   const body    = JSON.stringify({
     anthropic_version: 'bedrock-2023-05-31',
-    max_tokens:        1024,
+    max_tokens:        maxTokens,
     system:            systemPrompt,
     messages,
   });
@@ -205,6 +216,54 @@ Regulation references:
 
 If hasPII is false, set items to [], regulations to [], redactedText to the original text unchanged, and summary to "No PII detected".`;
 
+// ─── Vision agent system prompt ──────────────────────────────────────────────
+
+const IMAGE_SYSTEM_PROMPT = `You are a UAE data compliance AI agent analyzing an IMAGE before it is uploaded to a foreign AI service.
+
+Step 1 — Read every piece of text in the image, Arabic and English, including handwriting, stamps, ID cards, forms, screenshots, tables, and small print.
+Step 2 — Decide which of it is sensitive under UAE law.
+
+Treat these as sensitive:
+- Emirates ID cards or numbers (784-YYYY-NNNNNNN-C), and the card photo itself
+- Passports, visas, residence permits, driving licences, vehicle registration (mulkiya)
+- UAE phone numbers, IBANs (AE + 21 digits), bank statements, cheques, credit/debit cards
+- Full names of individuals in Arabic or English, signatures, dates of birth, addresses
+- Faces of identifiable people when shown together with any identifying document or record
+- Medical reports, prescriptions, lab results, patient identifiers, diagnoses
+- Credentials on screen: passwords, API keys, access keys, tokens, connection strings, private keys
+- Internal or classified government markings and letterheads
+
+For every sensitive finding return a normalized bounding box so the region can be masked before upload.
+Boxes use fractions of the image dimensions, origin at the top-left: x and y are the top-left corner, w and h the size, each between 0 and 1. Be generous — it is better for a box to be slightly too large than to leave part of a number visible.
+
+Respond ONLY with valid JSON in this exact schema — no markdown, no prose outside the JSON:
+
+{
+  "hasPII": boolean,
+  "imageDescription": "one sentence describing what the image is, with no sensitive values in it",
+  "items": [
+    {
+      "type": "string",
+      "value": "the exact text read from the image, or a short description for a non-text finding such as a face",
+      "masked": "the replacement placeholder e.g. [EMIRATES-ID]",
+      "regulation": "the specific UAE law involved",
+      "severity": "low | medium | high | critical",
+      "box": [x, y, w, h]
+    }
+  ],
+  "regulations": ["list of UAE laws potentially involved"],
+  "summary": "one sentence explaining what was found",
+  "safeToSend": boolean
+}
+
+Severity guide:
+- critical: credentials or keys on screen, an Emirates ID or passport image, a medical record identifying a patient
+- high: IBAN, bank statement, payment card, health data, government document
+- medium: phone number, email, name, address, face with a name
+- low: fragments or partial information
+
+If nothing sensitive is present set hasPII false, items [], regulations [], safeToSend true, and summary "No sensitive data detected in image".`;
+
 // ─── Analyze route ────────────────────────────────────────────────────────────
 
 async function analyzeText(text) {
@@ -224,6 +283,91 @@ async function analyzeText(text) {
   }
 
   return { ok: true, ...parsed };
+}
+
+// ─── Image analysis ──────────────────────────────────────────────────────────
+
+function parseAgentJson(raw) {
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  return JSON.parse(cleaned);
+}
+
+// Keep only boxes that are actually usable as a mask.
+function normalizeItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map(item => {
+    const box = item.box;
+    const valid = Array.isArray(box) && box.length === 4 &&
+      box.every(n => typeof n === 'number' && Number.isFinite(n)) &&
+      box[2] > 0 && box[3] > 0;
+    if (!valid) return { ...item, box: null };
+    const [x, y, w, h] = box;
+    const clamp = (n) => Math.min(1, Math.max(0, n));
+    return { ...item, box: [clamp(x), clamp(y), clamp(Math.min(w, 1 - clamp(x))), clamp(Math.min(h, 1 - clamp(y)))] };
+  });
+}
+
+const SEVERITY_ORDER = ['low', 'medium', 'high', 'critical'];
+
+function highestSeverity(items) {
+  let rank = -1;
+  for (const item of items || []) {
+    const i = SEVERITY_ORDER.indexOf(item.severity);
+    if (i > rank) rank = i;
+  }
+  return SEVERITY_ORDER[rank] || 'medium';
+}
+
+async function callLocalVision(imageBase64, mediaType) {
+  const res = await fetch(VISION_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ imageBase64, mediaType, prompt: IMAGE_SYSTEM_PROMPT }),
+    signal:  AbortSignal.timeout(60_000),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    return { ok: false, status: res.status, detail };
+  }
+  const data = await res.json();
+  // Accept either the parsed schema directly or a { text } envelope from a raw LLM server
+  return { ok: true, text: typeof data.text === 'string' ? data.text : JSON.stringify(data) };
+}
+
+async function analyzeImage(imageBase64, mediaType) {
+  const messages = [{
+    role: 'user',
+    content: [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+      { type: 'text',  text: 'Analyze this image for UAE sensitive data before it is uploaded to a foreign AI service.' },
+    ],
+  }];
+
+  const result = VISION_URL
+    ? await callLocalVision(imageBase64, mediaType)
+    : await callBedrock(messages, IMAGE_SYSTEM_PROMPT, 2048);
+
+  if (!result.ok) return { ok: false, error: 'vision_error', detail: result.detail };
+
+  let parsed;
+  try {
+    parsed = parseAgentJson(result.text);
+  } catch (e) {
+    return { ok: false, error: 'parse_error', raw: result.text, detail: String(e.message) };
+  }
+
+  const items = normalizeItems(parsed.items);
+  return {
+    ok:               true,
+    hasPII:           Boolean(parsed.hasPII),
+    imageDescription: parsed.imageDescription || '',
+    items,
+    regulations:      Array.isArray(parsed.regulations) ? parsed.regulations : [],
+    summary:          parsed.summary || '',
+    // A mask can only be drawn for findings the model located in the image
+    maskable:         items.length > 0 && items.every(i => i.box),
+    engine:           VISION_URL ? 'local-vision' : `bedrock:${BEDROCK_MODEL}`,
+  };
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -284,7 +428,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <h1>🛡️ Siyada — سيادة</h1>
 <p class="sub">UAE AI Compliance Dashboard</p>
 <div class="stats" id="stats"></div>
-<table><thead><tr><th>Time</th><th>Severity</th><th>PII Types</th><th>Summary</th></tr></thead>
+<table><thead><tr><th>Time</th><th>Channel</th><th>Severity</th><th>PII Types</th><th>Summary</th></tr></thead>
 <tbody id="tbody"></tbody></table>
 <script>
 async function load() {
@@ -294,9 +438,11 @@ async function load() {
     '<div class="stat"><div class="stat-v">'+d.total+'</div><div class="stat-l">Total Analyzed</div></div>' +
     '<div class="stat"><div class="stat-v" style="color:#FF6B6B">'+d.critical+'</div><div class="stat-l">Critical Events</div></div>' +
     '<div class="stat"><div class="stat-v">'+d.health+'</div><div class="stat-l">Health Data</div></div>' +
-    '<div class="stat"><div class="stat-v">'+d.financial+'</div><div class="stat-l">Financial Data</div></div>';
+    '<div class="stat"><div class="stat-v">'+d.financial+'</div><div class="stat-l">Financial Data</div></div>' +
+    '<div class="stat"><div class="stat-v">'+d.images+'</div><div class="stat-l">Images Scanned</div></div>';
   document.getElementById('tbody').innerHTML = d.events.map(e =>
     '<tr><td>'+new Date(e.ts).toLocaleTimeString()+'</td>' +
+    '<td>'+(e.src === 'image' ? '🖼️ image' : '💬 text')+'</td>' +
     '<td><span class="badge '+e.sev+'">'+e.sev+'</span></td>' +
     '<td>'+e.types+'</td>' +
     '<td style="color:#8B949E;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+e.summary+'</td></tr>'
@@ -319,7 +465,14 @@ const server = createServer(async (req, res) => {
 
   // Health
   if (req.method === 'GET' && url.pathname === '/health') {
-    sendJson(res, 200, { ok: true, service: 'siyada', model: BEDROCK_MODEL, region: AWS_REGION, total: events.length });
+    sendJson(res, 200, {
+      ok:      true,
+      service: 'siyada',
+      model:   BEDROCK_MODEL,
+      region:  AWS_REGION,
+      vision:  VISION_URL ? 'local' : 'bedrock',
+      total:   events.length,
+    });
     return;
   }
 
@@ -337,8 +490,10 @@ const server = createServer(async (req, res) => {
       critical: events.filter(e => e.severity === 'critical').length,
       health:   events.filter(e => e.hasHealthData).length,
       financial:events.filter(e => e.hasFinancialData).length,
+      images:   events.filter(e => e.source === 'image').length,
       events:   events.slice(0, 50).map(e => ({
         ts:      e.timestamp,
+        src:     e.source || 'text',
         sev:     e.severity || 'medium',
         types:   (e.items || []).map(i => i.type).join(', ') || '—',
         summary: e.summary || '—',
@@ -378,12 +533,69 @@ const server = createServer(async (req, res) => {
       const lowerText = text.toLowerCase();
       events.unshift({
         timestamp:       Date.now(),
-        severity:        result.items?.[0]?.severity || 'medium',
+        source:          'text',
+        severity:        highestSeverity(result.items),
         items:           result.items || [],
         hasHealthData:   healthKeywords.some(k => lowerText.includes(k)),
         hasFinancialData:financialKeywords.some(k => lowerText.includes(k)),
         summary:         result.summary || '',
         regulations:     result.regulations || [],
+      });
+      if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+    }
+
+    sendJson(res, 200, result);
+    return;
+  }
+
+  // ── POST /analyze-image — vision PII detection on an attachment ─────────────
+  if (req.method === 'POST' && url.pathname === '/analyze-image') {
+    let body;
+    try { body = JSON.parse(await readBody(req)); }
+    catch { sendJson(res, 400, { error: 'invalid_body' }); return; }
+
+    const imageBase64 = typeof body.imageBase64 === 'string' ? body.imageBase64 : '';
+    const mediaType   = typeof body.mediaType === 'string' ? body.mediaType.toLowerCase() : '';
+
+    if (!imageBase64) { sendJson(res, 400, { error: 'missing_image' }); return; }
+    if (!ALLOWED_MEDIA_TYPES.includes(mediaType)) {
+      sendJson(res, 400, { error: 'unsupported_media_type', allowed: ALLOWED_MEDIA_TYPES });
+      return;
+    }
+    // base64 length → decoded byte count
+    const bytes = Math.floor(imageBase64.length * 3 / 4);
+    if (bytes > MAX_IMAGE_BYTES) {
+      sendJson(res, 413, { error: 'image_too_large', max: MAX_IMAGE_BYTES, size: bytes });
+      return;
+    }
+
+    let result;
+    try {
+      result = await analyzeImage(imageBase64, mediaType);
+    } catch (err) {
+      cachedCreds = null;
+      sendJson(res, 500, { error: 'vision_error', message: String(err?.message ?? err) });
+      return;
+    }
+
+    if (!result.ok) {
+      sendJson(res, 500, { error: result.error, detail: result.detail, raw: result.raw });
+      return;
+    }
+
+    if (result.hasPII) {
+      const typeText = result.items.map(i => `${i.type} ${i.value}`).join(' ').toLowerCase();
+      const healthKeywords    = ['patient','diagnosis','medical','prescription','lab','hospital','clinic','مريض','تشخيص'];
+      const financialKeywords = ['iban','bank','card','account','cheque','statement','حساب'];
+      events.unshift({
+        timestamp:        Date.now(),
+        source:           'image',
+        severity:         highestSeverity(result.items),
+        items:            result.items.map(({ box: _box, ...rest }) => rest),
+        hasHealthData:    healthKeywords.some(k => typeText.includes(k)),
+        hasFinancialData: financialKeywords.some(k => typeText.includes(k)),
+        summary:          result.summary,
+        regulations:      result.regulations,
       });
       if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
     }
@@ -424,6 +636,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Siyada backend listening on http://localhost:${PORT}`);
   console.log(`  model  : ${BEDROCK_MODEL}`);
+  console.log(`  vision : ${VISION_URL || `bedrock (${BEDROCK_MODEL})`}`);
   console.log(`  region : ${AWS_REGION}`);
   console.log(`  dashboard: http://localhost:${PORT}/`);
 });

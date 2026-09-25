@@ -32,14 +32,21 @@ function renderEvents(events) {
       .slice(0, 4)
       .join('');
 
+    const isImage = ev.source === 'image';
+    const channel = isImage ? 'IMAGE' : 'TEXT';
+    const outcome = ev.outcome && ev.outcome !== 'blocked'
+      ? `<span class="tag" style="color:${ev.outcome === 'override' ? '#FF8C61' : '#8B949E'}">${ev.outcome}</span>`
+      : '';
+
     return `
       <div class="event">
         <div class="event-top">
+          <span class="chan-badge" title="${isImage ? 'image attachment' : 'text message'}">${channel}</span>
           <span class="sev-badge sev-${ev.severity}">${ev.severity}</span>
           <span class="event-time">${formatTime(ev.timestamp)}</span>
           <span class="event-url" title="${ev.url}">${formatUrl(ev.url)}</span>
         </div>
-        <div class="event-tags">${tags}</div>
+        <div class="event-tags">${tags}${outcome}</div>
       </div>`;
   }).join('');
 }
@@ -53,6 +60,7 @@ async function loadStats() {
   document.getElementById('statCritical').textContent = s.critical;
   document.getElementById('statHealth').textContent   = s.healthData;
   document.getElementById('statFinancial').textContent = s.financialData;
+  document.getElementById('statImages').textContent    = s.images;
 
   if (s.topRegulation && s.topRegulation !== '—') {
     document.getElementById('topReg').textContent = s.topRegulation;
