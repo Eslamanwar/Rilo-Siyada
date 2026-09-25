@@ -32,14 +32,19 @@ function renderEvents(events) {
       .slice(0, 4)
       .join('');
 
+    const channel = ev.source === 'image' ? '🖼️' : '💬';
+    const override = ev.outcome === 'override'
+      ? '<span class="tag" style="color:#FF8C61">override</span>' : '';
+
     return `
       <div class="event">
         <div class="event-top">
+          <span title="${ev.source === 'image' ? 'image attachment' : 'text message'}">${channel}</span>
           <span class="sev-badge sev-${ev.severity}">${ev.severity}</span>
           <span class="event-time">${formatTime(ev.timestamp)}</span>
           <span class="event-url" title="${ev.url}">${formatUrl(ev.url)}</span>
         </div>
-        <div class="event-tags">${tags}</div>
+        <div class="event-tags">${tags}${override}</div>
       </div>`;
   }).join('');
 }
@@ -53,6 +58,7 @@ async function loadStats() {
   document.getElementById('statCritical').textContent = s.critical;
   document.getElementById('statHealth').textContent   = s.healthData;
   document.getElementById('statFinancial').textContent = s.financialData;
+  document.getElementById('statImages').textContent    = s.images;
 
   if (s.topRegulation && s.topRegulation !== '—') {
     document.getElementById('topReg').textContent = s.topRegulation;

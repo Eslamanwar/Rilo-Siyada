@@ -3,11 +3,18 @@
  *
  * Injected into AI chat sites (Gemini, ChatGPT, Claude, Copilot).
  *
- * Flow:
+ * Text flow:
  *   1. While typing  → fast regex scan (scanner.js) updates the badge
  *   2. On Enter/Send → text sent to Siyada backend LLM agent
  *   3. LLM decides   → if PII found, overlay shows what was caught
  *   4. User chooses  → "Keep Editing" or "Send Redacted Version"
+ *
+ * Image flow:
+ *   1. Paste / drop / file picker → the attachment is held before the site sees it
+ *   2. Downscaled copy sent to the vision agent, which reads the image and
+ *      returns findings with normalized bounding boxes
+ *   3. If sensitive → overlay shows the image with the regions marked
+ *   4. User chooses  → discard, attach a masked copy, or override (logged)
  */
 
 (() => {
@@ -261,6 +268,25 @@
       box-shadow: 0 4px 12px rgba(0,0,0,.5);
     }
     #mic-toast.visible { display: block; }
+
+    /* Image review */
+    .img-preview {
+      padding: 12px 16px 0;
+      display: flex; justify-content: center;
+    }
+    .img-preview canvas {
+      max-width: 100%; border-radius: 8px;
+      border: 1px solid #21262D; background: #161B22;
+    }
+    .img-note {
+      padding: 8px 16px 0; font-size: 11px; color: #8B949E;
+    }
+    .override { padding: 0 16px 12px; }
+    .btn-override {
+      width: 100%; background: none; border: none; cursor: pointer;
+      color: #8B949E; font-size: 11px; text-decoration: underline; padding: 4px;
+    }
+    .btn-override:hover { color: #FF8C61; }
   `;
 
   function createOverlay() {
@@ -308,6 +334,33 @@
             </div>
           </div>
         </div>
+
+        <!-- Image review (hidden until an attachment is analyzed) -->
+        <div id="imgResults" style="display:none">
+          <div class="hdr">
+            <span style="font-size:20px">🖼️</span>
+            <span class="hdr-title">Siyada — Attachment Blocked</span>
+            <button class="hdr-close" id="imgCloseBtn">✕</button>
+          </div>
+          <div class="alert" id="imgAlert">
+            <span>⚠️</span>
+            <span id="imgAlertText"></span>
+          </div>
+          <div class="summary" id="imgSummary"></div>
+          <div class="img-preview"><canvas id="imgCanvas"></canvas></div>
+          <div class="img-note" id="imgNote"></div>
+          <div class="items" id="imgItems"></div>
+          <div class="fine">
+            Uploading may violate <strong id="imgTopReg"></strong> — fine up to <strong>AED 2,000,000</strong>
+          </div>
+          <div class="actions">
+            <button class="btn btn-block"  id="imgDiscardBtn">✕ Discard Image</button>
+            <button class="btn btn-redact" id="imgMaskBtn">🛡️ Attach Masked Copy</button>
+          </div>
+          <div class="override">
+            <button class="btn-override" id="imgOverrideBtn">Attach original anyway — recorded as a policy override</button>
+          </div>
+        </div>
       </div>
       <div id="badge" title="Siyada — UAE AI Shield">🛡️</div>
       <div id="mic-btn" class="idle" title="Voice input — Arabic &amp; English">🎤</div>
@@ -346,6 +399,12 @@
       setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
     });
     badge.addEventListener('click', () => panel.classList.toggle('visible'));
+
+    // ── Image review actions ────────────────────────────────────────────────
+    shadow.getElementById('imgCloseBtn').addEventListener('click',    () => resolveImageReview('discard'));
+    shadow.getElementById('imgDiscardBtn').addEventListener('click',  () => resolveImageReview('discard'));
+    shadow.getElementById('imgMaskBtn').addEventListener('click',     () => resolveImageReview('mask'));
+    shadow.getElementById('imgOverrideBtn').addEventListener('click', () => resolveImageReview('override'));
 
     // ── Voice recording ──────────────────────────────────────────────────────
     const micBtn   = shadow.getElementById('mic-btn');
@@ -461,6 +520,7 @@
   function showResults(analysis, inputEl) {
     shadow.getElementById('loading').classList.remove('visible');
     shadow.getElementById('results').style.display = 'block';
+    shadow.getElementById('imgResults').style.display = 'none';
 
     const { items = [], summary = '', regulations = [] } = analysis;
     const severity = items[0]?.severity || 'medium';
@@ -500,6 +560,7 @@
 
   function showClean() {
     shadow.getElementById('panel').classList.remove('visible');
+    shadow.getElementById('imgResults').style.display = 'none';
     setBadge('safe');
     pendingData = null;
   }
@@ -512,6 +573,7 @@
     // Re-use the panel but show error state
     shadow.getElementById('loading').classList.remove('visible');
     shadow.getElementById('results').style.display = 'block';
+    shadow.getElementById('imgResults').style.display = 'none';
     shadow.getElementById('preview').classList.remove('visible');
 
     shadow.getElementById('alertBanner').className = 'alert critical';
@@ -571,6 +633,263 @@
         key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true,
       }));
     }, 120);
+  }
+
+  // ─── Image interception ─────────────────────────────────────────────────
+  // The attachment is held before the page ever receives it: the paste, drop or
+  // file-picker event is cancelled, the image is analyzed, and only an approved
+  // copy is re-injected through a synthetic event.
+
+  const VISION_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  const MAX_ANALYSIS_EDGE  = 1568; // Claude's recommended long edge — larger buys nothing
+  const MAX_ANALYSIS_BYTES = 4 * 1024 * 1024;
+
+  let imageReview  = null; // { results, allFiles, reinject }
+  let scanningImage = false;
+
+  const isImageFile = f => f instanceof File && f.type.startsWith('image/');
+
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload  = () => resolve(String(reader.result).split(',')[1] || '');
+      reader.onerror = () => reject(new Error('Could not read the image'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function canvasToBlob(canvas, type, quality) {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(b => b ? resolve(b) : reject(new Error('Could not encode the image')), type, quality);
+    });
+  }
+
+  // Downscale and re-encode only when needed, so a small PNG is analyzed as-is.
+  async function prepareForAnalysis(file) {
+    const bitmap = await createImageBitmap(file);
+    const edge   = Math.max(bitmap.width, bitmap.height);
+    const scale  = Math.min(1, MAX_ANALYSIS_EDGE / edge);
+    const keepAsIs = scale === 1 &&
+      VISION_MEDIA_TYPES.includes(file.type) &&
+      file.size <= MAX_ANALYSIS_BYTES;
+
+    if (keepAsIs) {
+      return { base64: await fileToBase64(file), mediaType: file.type, bitmap };
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    const blob = await canvasToBlob(canvas, 'image/jpeg', 0.9);
+    const b64  = await fileToBase64(new File([blob], 'scan.jpg', { type: 'image/jpeg' }));
+    return { base64: b64, mediaType: 'image/jpeg', bitmap };
+  }
+
+  // Burn opaque boxes over every located finding, at full resolution.
+  async function maskImageFile(file, items) {
+    const bitmap = await createImageBitmap(file);
+    const canvas = document.createElement('canvas');
+    canvas.width  = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+
+    const fontSize = Math.max(11, Math.round(bitmap.height / 45));
+    ctx.font = `700 ${fontSize}px sans-serif`;
+    ctx.textBaseline = 'middle';
+
+    for (const item of items) {
+      if (!item.box) continue;
+      const [x, y, w, h] = item.box;
+      const px = x * bitmap.width;
+      const py = y * bitmap.height;
+      const pw = w * bitmap.width;
+      const ph = h * bitmap.height;
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(px, py, pw, ph);
+      ctx.fillStyle = '#00D4AA';
+      const label = item.masked || `[${String(item.type || 'REDACTED').toUpperCase()}]`;
+      if (pw > label.length * fontSize * 0.5) {
+        ctx.fillText(label, px + 4, py + ph / 2);
+      }
+    }
+
+    const blob = await canvasToBlob(canvas, 'image/png');
+    const stem = (file.name || 'image').replace(/\.[^.]+$/, '');
+    return new File([blob], `siyada-masked-${stem}.png`, { type: 'image/png' });
+  }
+
+  function showImageLoading() {
+    createOverlay();
+    setBadge('scanning');
+    shadow.getElementById('results').style.display = 'none';
+    shadow.getElementById('imgResults').style.display = 'none';
+    shadow.getElementById('loading').classList.add('visible');
+    shadow.getElementById('panel').classList.add('visible');
+  }
+
+  function drawPreview(bitmap, items) {
+    const canvas = shadow.getElementById('imgCanvas');
+    const scale  = Math.min(1, 400 / bitmap.width);
+    canvas.width  = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    ctx.lineWidth   = 2;
+    ctx.strokeStyle = '#FF3B3B';
+    ctx.fillStyle   = 'rgba(255,59,59,.28)';
+    for (const item of items) {
+      if (!item.box) continue;
+      const [x, y, w, h] = item.box;
+      const px = x * canvas.width;
+      const py = y * canvas.height;
+      const pw = w * canvas.width;
+      const ph = h * canvas.height;
+      ctx.fillRect(px, py, pw, ph);
+      ctx.strokeRect(px, py, pw, ph);
+    }
+  }
+
+  function showImageResults(review) {
+    const { results } = review;
+    const flagged = results.filter(r => r.analysis.hasPII);
+    const items   = flagged.flatMap(r => r.analysis.items || []);
+    const first   = flagged[0];
+
+    shadow.getElementById('loading').classList.remove('visible');
+    shadow.getElementById('results').style.display = 'none';
+    shadow.getElementById('imgResults').style.display = 'block';
+
+    const severity = ['critical','high','medium','low']
+      .find(s => items.some(i => i.severity === s)) || 'medium';
+
+    shadow.getElementById('imgAlert').className = `alert ${severity}`;
+    shadow.getElementById('imgAlertText').textContent =
+      `${items.length} sensitive item${items.length !== 1 ? 's' : ''} found in ${flagged.length} image${flagged.length !== 1 ? 's' : ''}`;
+    shadow.getElementById('imgSummary').textContent =
+      first.analysis.summary || first.analysis.imageDescription || '';
+
+    drawPreview(first.bitmap, first.analysis.items || []);
+
+    const maskable = flagged.every(r => r.analysis.maskable);
+    shadow.getElementById('imgMaskBtn').style.display = maskable ? '' : 'none';
+    shadow.getElementById('imgNote').textContent = maskable
+      ? 'Masking burns the marked regions out of the file itself — the original never leaves this browser.'
+      : 'The model could not locate every finding precisely, so a masked copy is not offered for this image.';
+
+    shadow.getElementById('imgItems').innerHTML = items.map(item => {
+      const value = String(item.value || '');
+      const display = value.length > 32 ? `${value.slice(0, 30)}…` : (value || '—');
+      return `<div class="item">
+        <div class="item-row">
+          <div class="dot dot-${item.severity || 'medium'}"></div>
+          <div class="item-type">${esc(String(item.type || '').replace(/_/g, ' '))}</div>
+          <div class="item-value">${esc(display)}</div>
+        </div>
+        <div class="item-reg">${esc(item.regulation || '')}</div>
+      </div>`;
+    }).join('');
+
+    shadow.getElementById('imgTopReg').textContent =
+      first.analysis.regulations?.[0] || items[0]?.regulation || 'UAE PDPL';
+
+    shadow.getElementById('panel').classList.add('visible');
+    setBadge('danger');
+  }
+
+  async function resolveImageReview(choice) {
+    const review = imageReview;
+    if (!review) return;
+    imageReview = null;
+    shadow.getElementById('panel').classList.remove('visible');
+
+    if (choice === 'discard') { setBadge('safe'); return; }
+
+    if (choice === 'override') {
+      logImageEvent(review, 'override');
+      review.reinject(review.allFiles);
+      setBadge('danger');
+      return;
+    }
+
+    // mask: clean images pass through untouched, flagged ones are masked
+    const approved = [];
+    for (const file of review.allFiles) {
+      const result = review.results.find(r => r.file === file);
+      if (!result || !result.analysis.hasPII) { approved.push(file); continue; }
+      if (!result.analysis.maskable) continue; // cannot be masked — dropped
+      try {
+        approved.push(await maskImageFile(file, result.analysis.items || []));
+      } catch { /* drop the image rather than attach it unmasked */ }
+    }
+    logImageEvent(review, 'masked');
+    if (approved.length) review.reinject(approved);
+    setBadge('safe');
+  }
+
+  function logImageEvent(review, outcome) {
+    const items = review.results.flatMap(r => r.analysis.items || []);
+    chrome.runtime.sendMessage({
+      type:      'SIYADA_INTERCEPTION',
+      source:    'image',
+      outcome,
+      items:     items.map(i => ({ type: i.type, regulation: i.regulation, severity: i.severity })),
+      url:       location.href,
+      timestamp: Date.now(),
+      severity:  ['critical','high','medium','low'].find(s => items.some(i => i.severity === s)) || 'medium',
+    }).catch(() => {});
+  }
+
+  // Returns true when Siyada has taken ownership of the attachment.
+  async function guardImageAttachment(fileList, reinject) {
+    const files  = Array.from(fileList || []);
+    const images = files.filter(isImageFile);
+    if (!images.length) return false;
+    if (scanningImage) return true;
+
+    scanningImage = true;
+    showImageLoading();
+
+    const results = [];
+    try {
+      for (const file of images) {
+        const { base64, mediaType, bitmap } = await prepareForAnalysis(file);
+        const res = await fetch(`${SIYADA_API}/analyze-image`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ imageBase64: base64, mediaType }),
+          signal:  AbortSignal.timeout(60_000),
+        });
+        if (!res.ok) throw new Error(`Server error ${res.status}`);
+        results.push({ file, bitmap, analysis: await res.json() });
+      }
+    } catch (err) {
+      // Same posture as text: unverified means blocked, never attached.
+      scanningImage = false;
+      showBackendError(err);
+      return true;
+    }
+    scanningImage = false;
+
+    if (!results.some(r => r.analysis.hasPII)) {
+      showClean();
+      reinject(files);
+      return true;
+    }
+
+    imageReview = { results, allFiles: files, reinject };
+    showImageResults(imageReview);
+    return true;
+  }
+
+  function toDataTransfer(files) {
+    const dt = new DataTransfer();
+    for (const f of files) dt.items.add(f);
+    return dt;
   }
 
   // ─── Core intercept ────────────────────────────────────────────────────────
@@ -637,7 +956,9 @@
       items:           (analysis.items || []).map(i => ({ type: i.type, regulation: i.regulation, severity: i.severity })),
       url:             location.href,
       timestamp:       Date.now(),
-      severity:        analysis.items?.[0]?.severity || 'medium',
+      severity:        ['critical','high','medium','low'].find(s => (analysis.items || []).some(i => i.severity === s)) || 'medium',
+      source:          'text',
+      outcome:         'blocked',
       hasHealthData:   analysis.hasHealthData || false,
       hasFinancialData:analysis.hasFinancialData || false,
     }).catch(() => {});
@@ -719,6 +1040,66 @@
       setBadge(window.SiyadaScanner?.mightBeSensitive(text) ? 'scanning' : 'safe');
     }, 300);
   }, { capture: false });
+
+  // ─── Attachment intercepts ─────────────────────────────────────────────
+  // Each one cancels the real event and re-fires a synthetic copy after review.
+  // The isTrusted guard keeps our own re-injection from being intercepted again.
+
+  document.addEventListener('paste', (e) => {
+    if (!e.isTrusted) return;
+    const files = e.clipboardData?.files;
+    if (!files?.length || !Array.from(files).some(isImageFile)) return;
+
+    const target = e.target;
+    const captured = Array.from(files);
+    e.preventDefault();
+    e.stopImmediatePropagation();
+
+    guardImageAttachment(captured, (approved) => {
+      if (!approved.length) return;
+      target.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: toDataTransfer(approved), bubbles: true, cancelable: true,
+      }));
+    });
+  }, { capture: true });
+
+  document.addEventListener('drop', (e) => {
+    if (!e.isTrusted) return;
+    const files = e.dataTransfer?.files;
+    if (!files?.length || !Array.from(files).some(isImageFile)) return;
+
+    const target = e.target;
+    const captured = Array.from(files);
+    e.preventDefault();
+    e.stopImmediatePropagation();
+
+    guardImageAttachment(captured, (approved) => {
+      if (!approved.length) return;
+      target.dispatchEvent(new DragEvent('drop', {
+        dataTransfer: toDataTransfer(approved), bubbles: true, cancelable: true,
+      }));
+    });
+  }, { capture: true });
+
+  // A file picker cannot be cancelled, so the selection is pulled off the input
+  // and the input is emptied before the site's own change handler runs.
+  document.addEventListener('change', (e) => {
+    if (!e.isTrusted) return;
+    const input = e.target;
+    if (!(input instanceof HTMLInputElement) || input.type !== 'file') return;
+    const files = input.files;
+    if (!files?.length || !Array.from(files).some(isImageFile)) return;
+
+    const captured = Array.from(files);
+    e.stopImmediatePropagation();
+    input.value = '';
+
+    guardImageAttachment(captured, (approved) => {
+      if (!approved.length) return;
+      input.files = toDataTransfer(approved).files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }, { capture: true });
 
   // Ensure badge is present as soon as the page loads
   createOverlay();
