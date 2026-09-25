@@ -26,7 +26,7 @@ classes:
   credentials:
     action: block
     reason: "A leaked key cannot be un-leaked. No business case releases one."
-    matches: [password, api_key, secret, access_key, private_key, token, credential, connection_string]
+    matches: [password, api_key, secret, access_key, private_key, token, credential, connection_string, aws_account_id, webhook, basic_auth, jwt]
 
   emirates_id:
     action: break_glass

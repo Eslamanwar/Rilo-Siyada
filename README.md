@@ -70,6 +70,32 @@ only way "masked" means anything.
 
 Supported: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, up to 5 MiB.
 
+## Secrets in Source Code
+
+The most common leak is not a name or an ID — it is a developer pasting a
+config file, a Terraform block or a stack trace into a chat, with an AWS key
+still inside it. A language model will usually notice; "usually" is not a
+security control. So credentials with a known shape are matched **exactly**,
+before the model runs, in `server/src/secrets.js`:
+
+- AWS access key IDs (`AKIA…`/`ASIA…`), secret access keys, session tokens,
+  and 12-digit account IDs in ARNs, ECR hosts and console URLs
+- GitHub, GitLab, Slack, Google, Stripe, OpenAI, Anthropic, SendGrid, Twilio
+  and Azure Storage keys
+- PEM private keys, JWTs, `Bearer`/`Basic` authorization headers
+- `user:password@host` connection strings
+- `password = "…"`, `API_KEY: …`, `export CLIENT_SECRET=…` assignments in any
+  language or `.env` file (placeholders such as `${VAR}` and `process.env.X`
+  are ignored)
+
+The scanner's findings are merged into the agent's verdict and its masks are
+applied on top of the agent's redaction, so a key the model missed is still
+removed. Pasted text may be up to 20 000 characters — the scanner reads all of
+it even where the model sees only the head. If Bedrock is unreachable the
+findings are still returned, so the user sees *what* was caught rather than a
+bare error. Every scanner type classifies as `credentials` in the policy,
+which means `block`: no justification, no break-glass.
+
 ## Policy as Code (`siyada-policy.yaml`)
 
 Detection says *what* the data is. The policy file says what **this organisation**
@@ -298,7 +324,7 @@ server/
   data/ledger.jsonl    The chain itself (gitignored, created on first run)
 extension/
   manifest.json        Chrome extension manifest (MV3)
-  lib/scanner.js       PII detection engine (zero deps, content-script safe)
+  lib/scanner.js       Live badge hint — keywords + credential prefixes (AKIA, ghp_, PEM)
   interceptor.js       DOM hooks for AI chat sites
   background.js        Service worker — compliance log storage
   popup/
