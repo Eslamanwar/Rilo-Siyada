@@ -2,8 +2,10 @@
  * Siyada Backend
  *
  * Routes:
- *   POST /analyze        → { text } → Claude PII agent → { hasPII, items, redactedText, ... }
- *   POST /analyze-image  → { imageBase64, mediaType } → vision PII agent → { hasPII, items, boxes, ... }
+ *   POST /analyze        → { text } → Claude PII agent → { hasPII, items, redactedText, policy, ... }
+ *   POST /analyze-image  → { imageBase64, mediaType } → vision PII agent → { hasPII, items, boxes, policy, ... }
+ *   POST /release        → { decisionId, justification, approvals } → grant or refusal for the original data
+ *   GET  /policy         → the active policy, its hash, and any load error
  *   GET  /health         → service health
  *   GET  /               → simple dashboard HTML
  *
@@ -13,6 +15,9 @@
 
 import { createServer }         from 'node:http';
 import { createHash, createHmac } from 'node:crypto';
+import { resolve as resolvePath } from 'node:path';
+import { fileURLToPath }          from 'node:url';
+import { evaluate, checkRelease, loadPolicy, watchPolicy, getPolicy, RELEASE_WINDOW_MS } from './policy.js';
 
 const PORT          = Number(process.env.PORT || 3200);
 // BEDROCK_REGION is used instead of AWS_REGION to avoid conflict with shell env vars
@@ -39,6 +44,21 @@ const CORS_HEADERS = {
 // ─── In-memory compliance log ────────────────────────────────────────────────
 const events = [];
 const MAX_EVENTS = 500;
+
+// ─── Policy as code ──────────────────────────────────────────────────────────
+const POLICY_FILE = resolvePath(
+  process.env.POLICY_FILE || fileURLToPath(new URL('../../siyada-policy.yaml', import.meta.url)),
+);
+
+// Decisions live only long enough for the user to justify or get approval.
+const decisions = new Map();
+
+function recordDecision(decision) {
+  decisions.set(decision.id, decision);
+  const cutoff = Date.now() - RELEASE_WINDOW_MS;
+  for (const [id, d] of decisions) if (d.issuedAt < cutoff) decisions.delete(id);
+  return decision;
+}
 
 // ─── AWS SigV4 helpers ───────────────────────────────────────────────────────
 
@@ -424,13 +444,23 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .high     { background: rgba(255,107,53,.2); color: #FF8C61; }
   .medium   { background: rgba(255,193,7,.15); color: #FFD60A; }
   .low      { background: rgba(139,148,158,.2); color: #8B949E; }
+  .act { font-size: 11px; font-weight: 700; color: #8B949E; }
+  .act-block { color: #FF6B6B; }
+  .act-break_glass { color: #FF8C61; }
+  .act-allow_with_justification { color: #FFD60A; }
+  .act-redact { color: #00D4AA; }
+  .policy-bar { background: #161B22; border: 1px solid #21262D; border-left: 3px solid #00D4AA;
+                border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 12px; color: #8B949E; }
+  .policy-bar code { color: #E6EDF3; }
+  .policy-bad { border-left-color: #FF6B6B; color: #FF6B6B; }
 </style>
 </head>
 <body>
 <h1>🛡️ Siyada — سيادة</h1>
 <p class="sub">UAE AI Compliance Dashboard</p>
+<div class="policy-bar" id="policyBar"></div>
 <div class="stats" id="stats"></div>
-<table><thead><tr><th>Time</th><th>Channel</th><th>Severity</th><th>PII Types</th><th>Summary</th></tr></thead>
+<table><thead><tr><th>Time</th><th>Channel</th><th>Severity</th><th>PII Types</th><th>Policy</th><th>Summary</th></tr></thead>
 <tbody id="tbody"></tbody></table>
 <script>
 async function load() {
@@ -441,12 +471,19 @@ async function load() {
     '<div class="stat"><div class="stat-v" style="color:#FF6B6B">'+d.critical+'</div><div class="stat-l">Critical Events</div></div>' +
     '<div class="stat"><div class="stat-v">'+d.health+'</div><div class="stat-l">Health Data</div></div>' +
     '<div class="stat"><div class="stat-v">'+d.financial+'</div><div class="stat-l">Financial Data</div></div>' +
-    '<div class="stat"><div class="stat-v">'+d.images+'</div><div class="stat-l">Images Scanned</div></div>';
+    '<div class="stat"><div class="stat-v">'+d.images+'</div><div class="stat-l">Images Scanned</div></div>' +
+    '<div class="stat"><div class="stat-v" style="color:#FF8C61">'+d.released+'</div><div class="stat-l">Originals Released</div></div>';
+  const bar = document.getElementById('policyBar');
+  bar.className = 'policy-bar' + (d.policy.error ? ' policy-bad' : '');
+  bar.innerHTML = d.policy.error
+    ? 'Policy not enforceable — ' + d.policy.error
+    : 'Governed by <code>' + d.policy.organization + '</code> policy <code>' + d.policy.hash + '</code>';
   document.getElementById('tbody').innerHTML = d.events.map(e =>
     '<tr><td>'+new Date(e.ts).toLocaleTimeString()+'</td>' +
     '<td>'+(e.src === 'image' ? '🖼️ image' : '💬 text')+'</td>' +
     '<td><span class="badge '+e.sev+'">'+e.sev+'</span></td>' +
     '<td>'+e.types+'</td>' +
+    '<td><span class="act act-'+e.action+'">'+e.action+(e.outcome ? ' · '+e.outcome : '')+'</span></td>' +
     '<td style="color:#8B949E;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+e.summary+'</td></tr>'
   ).join('');
 }
@@ -473,6 +510,7 @@ const server = createServer(async (req, res) => {
       model:   BEDROCK_MODEL,
       region:  AWS_REGION,
       vision:  VISION_URL ? 'local' : 'bedrock',
+      policy:  { hash: getPolicy().hash, version: getPolicy().policy.version, error: getPolicy().error },
       total:   events.length,
     });
     return;
@@ -493,11 +531,15 @@ const server = createServer(async (req, res) => {
       health:   events.filter(e => e.hasHealthData).length,
       financial:events.filter(e => e.hasFinancialData).length,
       images:   events.filter(e => e.source === 'image').length,
+      released: events.filter(e => e.outcome === 'released').length,
+      policy:   { organization: getPolicy().policy.organization, hash: getPolicy().hash, error: getPolicy().error },
       events:   events.slice(0, 50).map(e => ({
         ts:      e.timestamp,
         src:     e.source || 'text',
         sev:     e.severity || 'medium',
         types:   (e.items || []).map(i => i.type).join(', ') || '—',
+        action:  e.policyAction || '—',
+        outcome: e.outcome || '',
         summary: e.summary || '—',
       })),
     });
@@ -528,8 +570,10 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Log the event
+    // What the organisation permits is decided here, not in the extension.
     if (result.hasPII) {
+      result.policy = recordDecision(evaluate(result.items, 'text'));
+
       const healthKeywords = ['patient','diagnosis','medication','treatment','hospital','clinic','مريض','تشخيص'];
       const financialKeywords = ['account','balance','transaction','iban','bank','حساب'];
       const lowerText = text.toLowerCase();
@@ -542,6 +586,9 @@ const server = createServer(async (req, res) => {
         hasFinancialData:financialKeywords.some(k => lowerText.includes(k)),
         summary:         result.summary || '',
         regulations:     result.regulations || [],
+        policyAction:    result.policy.action,
+        policyHash:      result.policy.policyHash,
+        decisionId:      result.policy.id,
       });
       if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
     }
@@ -586,6 +633,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (result.hasPII) {
+      result.policy = recordDecision(evaluate(result.items, 'image'));
+
       const typeText = result.items.map(i => `${i.type} ${i.value}`).join(' ').toLowerCase();
       const healthKeywords    = ['patient','diagnosis','medical','prescription','lab','hospital','clinic','مريض','تشخيص'];
       const financialKeywords = ['iban','bank','card','account','cheque','statement','حساب'];
@@ -598,11 +647,57 @@ const server = createServer(async (req, res) => {
         hasFinancialData: financialKeywords.some(k => typeText.includes(k)),
         summary:          result.summary,
         regulations:      result.regulations,
+        policyAction:     result.policy.action,
+        policyHash:       result.policy.policyHash,
+        decisionId:       result.policy.id,
       });
       if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
     }
 
     sendJson(res, 200, result);
+    return;
+  }
+
+  // ── GET /policy — the active policy, for the dashboard and for auditors ───
+  if (req.method === 'GET' && url.pathname === '/policy') {
+    const { policy, hash, path, error } = getPolicy();
+    sendJson(res, error ? 503 : 200, { policy, hash, path, error });
+    return;
+  }
+
+  // ── POST /release — may the ORIGINAL data be sent under this decision? ────
+  if (req.method === 'POST' && url.pathname === '/release') {
+    let body;
+    try { body = JSON.parse(await readBody(req)); }
+    catch { sendJson(res, 400, { error: 'invalid_body' }); return; }
+
+    const decision = decisions.get(String(body.decisionId || ''));
+    const verdict  = checkRelease(decision, {
+      justification: body.justification,
+      approvals:     Array.isArray(body.approvals) ? body.approvals : [],
+      requester:     body.requester,
+    });
+
+    // Refusals are logged too — an attempted release is the interesting event.
+    events.unshift({
+      timestamp:    Date.now(),
+      source:       decision?.channel || 'release',
+      severity:     'high',
+      items:        [],
+      summary:      verdict.granted
+        ? `Original released under ${decision.action}: ${verdict.justification || ''}`
+        : `Release refused (${verdict.error})`,
+      policyAction: decision?.action || 'unknown',
+      policyHash:   decision?.policyHash || 'none',
+      decisionId:   body.decisionId || null,
+      outcome:      verdict.granted ? 'released' : 'refused',
+      justification: verdict.justification || '',
+      approvedBy:   verdict.approvedBy || [],
+    });
+    if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+
+    if (verdict.granted) decisions.delete(decision.id); // one grant per decision
+    sendJson(res, verdict.granted ? 200 : 403, verdict);
     return;
   }
 
@@ -635,8 +730,15 @@ const server = createServer(async (req, res) => {
   sendJson(res, 404, { error: 'not_found' });
 });
 
+loadPolicy(POLICY_FILE);
+watchPolicy(POLICY_FILE, ({ hash, error }) => {
+  console.log(error ? `  policy : RELOAD FAILED — ${error}` : `  policy : reloaded (${hash})`);
+});
+
 server.listen(PORT, () => {
+  const { hash, error } = getPolicy();
   console.log(`Siyada backend listening on http://localhost:${PORT}`);
+  console.log(`  policy : ${error ? `UNENFORCEABLE — ${error}` : `${POLICY_FILE} (${hash})`}`);
   console.log(`  model  : ${BEDROCK_MODEL}`);
   console.log(`  vision : ${VISION_URL || `bedrock (${BEDROCK_MODEL})`}`);
   console.log(`  region : ${AWS_REGION}`);

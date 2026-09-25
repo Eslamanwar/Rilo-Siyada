@@ -1,0 +1,58 @@
+# Siyada — organisational data policy
+#
+# This file is the control. Detection says what the data is; this says what the
+# organisation permits. Edit it, save it, and the running server picks it up —
+# no redeploy, no code change, and every decision records the hash of the exact
+# file that produced it.
+#
+# Actions, from most permissive to most restrictive:
+#   allow                     data of this class may be sent untouched
+#   redact                    a redacted copy is sent; the original never leaves
+#   allow_with_justification  the original may be sent after a written reason
+#   break_glass               the original may be sent only with named approvals
+#   block                     the original never leaves, and cannot be overridden
+#
+# The strictest action across everything found in a message governs that message.
+
+version: 1
+organization: "Emirates Health Services"
+default_action: redact          # applied to anything no class matches
+
+justification:
+  min_length: 30                # a reason short enough to be meaningless is not a reason
+
+classes:
+
+  credentials:
+    action: block
+    reason: "A leaked key cannot be un-leaked. No business case releases one."
+    matches: [password, api_key, secret, access_key, private_key, token, credential, connection_string]
+
+  emirates_id:
+    action: break_glass
+    reason: "Federal Law 2/2019, Art. 13 — identity documents leave only with dual sign-off"
+    matches: [emirates_id, national_id, passport, visa, residence_permit, driving_licence]
+    approvers: [dpo@ehs.gov.ae, ciso@ehs.gov.ae, compliance@ehs.gov.ae]
+    min_approvals: 2
+
+  health:
+    action: allow_with_justification
+    reason: "Clinical data may be processed externally when the purpose is recorded"
+    matches: [patient, diagnosis, medical, prescription, lab_result, health, treatment, medical_record]
+
+  financial:
+    action: allow_with_justification
+    reason: "CBUAE Consumer Protection Regulation — release must be attributable"
+    matches: [iban, bank_account, credit_card, debit_card, cheque, bank_statement]
+
+  identity:
+    action: redact
+    reason: "UAE PDPL (Decree-Law 45/2021) — pseudonymise before external processing"
+    matches: [name, email, phone, address, date_of_birth, face, signature]
+
+# Per-channel tightening. An image cannot be partially released the way a
+# sentence can, so an ID card photo is blocked outright rather than break-glass.
+channels:
+  image:
+    emirates_id: block
+    financial: block

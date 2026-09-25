@@ -70,6 +70,81 @@ only way "masked" means anything.
 
 Supported: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, up to 5 MiB.
 
+## Policy as Code (`siyada-policy.yaml`)
+
+Detection says *what* the data is. The policy file says what **this organisation**
+is allowed to do with it — and that decision belongs to the DPO in a reviewable
+file, not to a constant inside a browser extension.
+
+```yaml
+version: 1
+organization: "Emirates Health Services"
+default_action: redact          # anything no class matches
+
+justification:
+  min_length: 30
+
+classes:
+  credentials:
+    action: block
+    matches: [password, api_key, access_key, token]
+
+  emirates_id:
+    action: break_glass
+    reason: "Federal Law 2/2019, Art. 13 — dual sign-off"
+    matches: [emirates_id, passport, national_id]
+    approvers: [dpo@ehs.gov.ae, ciso@ehs.gov.ae, compliance@ehs.gov.ae]
+    min_approvals: 2
+
+  financial:
+    action: allow_with_justification
+    matches: [iban, bank_account, credit_card]
+
+  identity:
+    action: redact
+    matches: [name, email, phone, face]
+
+channels:                        # a channel may only tighten a class
+  image:
+    emirates_id: block
+```
+
+| Action | What the user can do |
+|--------|----------------------|
+| `allow` | send as-is |
+| `redact` | send the redacted text / masked image; the original stays local |
+| `allow_with_justification` | send the original after writing a recorded reason |
+| `break_glass` | send the original after a reason **and** *N* named approvers sign off |
+| `block` | the original never leaves, and the panel offers no override |
+
+Rules that make it enforcement rather than decoration:
+
+- **The strictest action wins.** One `break_glass` finding in a message full of
+  `redact` findings governs the whole message —
+  `allow < redact < allow_with_justification < break_glass < block`.
+- **The server decides, the extension obeys.** The decision is made in
+  `/analyze`; the panel only renders the buttons that decision permits, and the
+  original is released only after `/release` grants it. There is no client-side
+  "approved" flag to forge.
+- **Fail closed.** A missing or malformed policy does not degrade to "allow" —
+  it blocks everything, `/policy` returns 503, and the dashboard says so.
+- **No self-approval**, duplicate approvers count once, unlisted approvers count
+  zero, and a decision expires 10 minutes after it is issued.
+- **The hash is the evidence.** The file is SHA-256'd on load; every decision and
+  every audit event carries `policyHash` and `version`, so an event can be tied
+  to the exact policy text that produced it. Edit the file and the hash changes.
+- **Editing is a file save, not a deployment.** The server watches the file and
+  reloads it live — change `emirates_id` to `block` mid-demo and the next send
+  is refused.
+
+Use `POLICY_FILE=/etc/siyada/policy.yaml` to point at a policy outside the repo
+(a sector pack, a mounted ConfigMap).
+
+```bash
+curl localhost:3000/policy            # active policy, hash, load error
+cd server && npm test                 # policy engine + masking geometry
+```
+
 ## Backend / Vision Agent
 
 ```bash
@@ -80,8 +155,10 @@ cd server && npm start          # http://localhost:3000, dashboard at /
 |-------|---------|
 | `POST /analyze` | Text prompt analysis |
 | `POST /analyze-image` | Image analysis — `{ imageBase64, mediaType }` |
-| `GET /stats` | Compliance events (text + image channels) |
-| `GET /health` | Model, region, active vision engine |
+| `POST /release` | Release the original — `{ decisionId, justification, requester, approvals }` |
+| `GET /policy` | Active policy, its hash, and any load error |
+| `GET /stats` | Compliance events (text + image channels, policy action per event) |
+| `GET /health` | Model, region, active vision engine, policy hash |
 
 Default engine is Claude Haiku vision on Bedrock — a **simulation** while the
 local model is being built. Point `VISION_URL` at your own service to take the
@@ -149,6 +226,7 @@ His phone is +971-50-1234567. What medication should I prescribe?
 ## Project Structure
 
 ```
+siyada-policy.yaml     Organisational policy — the DPO edits this, not the code
 extension/
   manifest.json        Chrome extension manifest (MV3)
   lib/scanner.js       PII detection engine (zero deps, content-script safe)
@@ -163,6 +241,8 @@ extension/
 ## Roadmap
 
 - [x] Image/screenshot scanning (vision agent, bounding-box masking)
+- [x] Policy as code with justification and break-glass dual approval
+- [ ] Signed sector policy packs (PDPL, DHA/MOH, CBUAE, DIFC/ADGM)
 - [ ] Voice call monitoring (Sensor 2)
 - [ ] Jetson Orin Nano vision service behind `VISION_URL`
 - [ ] Backend with AWS Bedrock UAE region for compliant LLM answers
